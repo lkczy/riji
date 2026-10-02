@@ -57,7 +57,7 @@ File _settingsFile() {
 /// 改名之后不能当作什么都没发生：设置里存着**用户的日记目录**。新目录里
 /// 找不到它，程序就会回退到默认位置、打开一个空白日记——用户会以为日记
 /// 没了（数据其实一个字节都没少，只是程序不知道该去哪找）。
-const String _legacyAppDirName = 'riji';
+const String _legacyAppDirName = 'myDiary';
 
 /// 首次运行时把旧设置搬过来。只在**新位置还没有设置**时才动手，所以只生效一次。
 ///
