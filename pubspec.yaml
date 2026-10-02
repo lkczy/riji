@@ -1,0 +1,45 @@
+name: riji
+description: "日迹 —— 一个把日记存成 Markdown 文件的本地日记程序。"
+publish_to: 'none'
+
+version: 1.0.0
+
+environment:
+  sdk: ^3.13.4
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  cupertino_icons: ^1.0.8
+
+  # front matter 的解析与生成
+  yaml: ^3.1.2
+
+  # 跨平台路径拼接
+  path: ^1.9.1
+
+  # 刻意不引入 path_provider 等任何**插件**（带原生代码的包）。
+  # 原因：Flutter 为插件建符号链接要求 Windows 开启开发者模式，
+  # 而开启开发者模式需要管理员权限。我们只需要定位一个默认目录，
+  # 用环境变量就够了。零插件的附带好处是项目结构更简单、web 预览更容易。
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true
+
+  # 黄历数据表（约 1.4 MB，2000–2060 年）。
+  #
+  # 做成资源文件而不是 Dart 源码：两万多行的常量会让每次编译都变慢，
+  # 而资源文件是独立文件，不参与编译。读取用 rootBundle，仍然是核心 Flutter，
+  # 没有引入任何插件。
+  #
+  # 由 tool/generate_huangli.py 生成，那个文件头部解释了哪些内容可验证、
+  # 哪些不可验证。
+  assets:
+    - assets/huangli.tsv
