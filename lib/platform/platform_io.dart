@@ -57,29 +57,58 @@ File _settingsFile() {
 /// 改名之后不能当作什么都没发生：设置里存着**用户的日记目录**。新目录里
 /// 找不到它，程序就会回退到默认位置、打开一个空白日记——用户会以为日记
 /// 没了（数据其实一个字节都没少，只是程序不知道该去哪找）。
-const String _legacyAppDirName = 'myDiary';
+///
+/// ⚠️ **这个字面量必须是旧名字 `myDiary`**：它指向的是"程序改名之前"的目录。
+/// 改名的批量替换曾经把它一起改成了 `riji`，迁移于是**静默失效**——不报错，
+/// 只会在某次重启后让用户以为日记丢了。`settings_migration_test.dart`
+/// 有一条测试专门钉住它。
+const String legacyAppDirName = 'myDiary';
 
 /// 首次运行时把旧设置搬过来。只在**新位置还没有设置**时才动手，所以只生效一次。
 ///
 /// 搬不动也绝不报错：最坏情况是回到默认日记位置，那也比打不开程序好。
-Future<void> _migrateLegacySettings(File target) async {
+/// 把旧目录里的设置搬到 [target]。
+///
+/// 只在 [target] **还不存在**时动手，所以它只会生效一次，也绝不会覆盖新设置。
+/// 返回是否真的搬了——返回值是给测试用的，调用方不看。
+///
+/// 参数显式传进来（而不是在这里读 `Platform.environment`），目的就是让测试
+/// 能塞两个临时目录进来，不必去碰真实的 `%APPDATA%`。
+///
+/// 搬不动也绝不抛异常：最坏情况是回到默认日记位置，那也比打不开程序好。
+Future<bool> migrateLegacySettings({
+  required String legacyDir,
+  required File target,
+}) async {
   try {
-    if (await target.exists()) return;
-    final base = Platform.environment['APPDATA'];
-    if (base == null || base.isEmpty) return;
-    final legacy = File(p.join(base, _legacyAppDirName, 'settings.json'));
-    if (!await legacy.exists()) return;
+    if (await target.exists()) return false;
+    final legacy = File(p.join(legacyDir, 'settings.json'));
+    if (!await legacy.exists()) return false;
     await target.parent.create(recursive: true);
     await legacy.copy(target.path);
     stderr.writeln('[riji] 已把旧设置迁移到 ${target.path}');
+    return true;
   } catch (_) {
-    // 迁移失败不能影响启动
+    return false;
   }
+}
+
+/// 启动时调用：把 `%APPDATA%\myDiary\settings.json` 搬到当前的位置。
+///
+/// 迁移失败**不能影响启动**：最坏是回到默认日记位置，用户会在界面里看到
+/// 日记是空的，但程序本身能开。
+Future<void> _migrateLegacySettingsIfNeeded(File target) async {
+  final base = Platform.environment['APPDATA'];
+  if (base == null || base.isEmpty) return;
+  await migrateLegacySettings(
+    legacyDir: p.join(base, legacyAppDirName),
+    target: target,
+  );
 }
 
 Future<String?> readSettingsJson() async {
   final file = _settingsFile();
-  await _migrateLegacySettings(file);
+  await _migrateLegacySettingsIfNeeded(file);
   try {
     if (!await file.exists()) return null;
     return await file.readAsString();
