@@ -1,4 +1,4 @@
-#ifndef RUNNER_WIN32_WINDOW_H_
+﻿#ifndef RUNNER_WIN32_WINDOW_H_
 #define RUNNER_WIN32_WINDOW_H_
 
 #include <windows.h>
@@ -12,16 +12,18 @@
 // rendering and input handling
 class Win32Window {
  public:
+  // 有符号：多显示器时副屏可以位于主屏左侧 / 上方，
+  // 此时 x / y 是负数（GetWindowPlacement 也会给出负值）。
   struct Point {
-    unsigned int x;
-    unsigned int y;
-    Point(unsigned int x, unsigned int y) : x(x), y(y) {}
+    long long x;
+    long long y;
+    Point(long long x, long long y) : x(x), y(y) {}
   };
 
   struct Size {
-    unsigned int width;
-    unsigned int height;
-    Size(unsigned int width, unsigned int height)
+    long long width;
+    long long height;
+    Size(long long width, long long height)
         : width(width), height(height) {}
   };
 
@@ -38,6 +40,11 @@ class Win32Window {
 
   // Show the current window. Returns true if the window was successfully shown.
   bool Show();
+
+  // 指定 Show() 用哪个 SW_* 命令（默认 SW_SHOWNORMAL）。
+  // 用来让「上次是最大化」的窗口在第一次显示时就直接最大化，
+  // 避免先正常显示、再最大化的跳动。必须在 Show() 之前调用。
+  void SetShowCommand(int show_command);
 
   // Release OS resources associated with window.
   void Destroy();
@@ -91,6 +98,9 @@ class Win32Window {
   static void UpdateTheme(HWND const window);
 
   bool quit_on_close_ = false;
+
+  // Show() 使用的 ShowWindow 命令，见 SetShowCommand。
+  int show_command_ = SW_SHOWNORMAL;
 
   // window handle for top level window.
   HWND window_handle_ = nullptr;
