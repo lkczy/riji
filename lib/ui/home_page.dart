@@ -3,17 +3,24 @@ import 'dart:async';
 import 'dart:ui' show AppExitResponse;
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../core/backup.dart';
+import '../core/command_palette.dart';
 import '../core/day.dart';
 import '../core/diary_location.dart';
+import '../data/settings.dart';
 import '../platform/platform.dart' as platform;
 import '../state/diary_controller.dart';
 import '../state/settings_controller.dart';
+import 'command_palette.dart';
+import 'diary_actions.dart';
 import 'diary_location_dialog.dart';
 import 'editor_panel.dart';
 import 'entry_list_panel.dart';
+import 'markdown_formatting.dart';
 import 'prompts.dart';
+import 'theme.dart';
 
 class DiaryHomePage extends StatefulWidget {
   const DiaryHomePage({
@@ -36,10 +43,17 @@ class _DiaryHomePageState extends State<DiaryHomePage>
   final TextEditingController _body = TextEditingController();
   final FocusNode _bodyFocus = FocusNode();
 
+  /// 侧栏搜索框的焦点。命令面板的「搜索日记」要能把光标送进去，
+  /// 所以节点由这里持有——面板和侧栏是兄弟，面板够不到侧栏的私有状态。
+  final FocusNode _searchFocus = FocusNode();
+
   DateTime? _syncedDate;
   int _syncedRevision = -1;
   bool _promptsShown = false;
   bool _zenMode = false;
+
+  /// 命令面板是不是开着。防止连按两次 Ctrl+K 叠出两层。
+  bool _paletteOpen = false;
 
   /// 盯住磁盘的定时器——见 [initState]。它必须由界面持有，随树一起销毁。
   Timer? _externalWatchTimer;
@@ -120,6 +134,7 @@ class _DiaryHomePageState extends State<DiaryHomePage>
 
     _body.dispose();
     _bodyFocus.dispose();
+    _searchFocus.dispose();
     super.dispose();
   }
 
@@ -251,6 +266,398 @@ class _DiaryHomePageState extends State<DiaryHomePage>
         .showSnackBar(SnackBar(content: Text(message)));
   }
 
+  // ---------------------------------------------------------------------------
+  // 命令面板
+  // ---------------------------------------------------------------------------
+
+  /// 唤出命令面板。
+  ///
+  /// 面板挂在**这里**而不是 `EditorPanel` 里，因为 Ctrl+K 必须在侧栏搜索框、
+  /// 心情/天气/标签输入框都有焦点时也能用——那些控件是写作区的兄弟或别的子树，
+  /// 藏在 `EditorPanel` 内部就够不到它们了。
+  Future<void> _openCommandPalette() async {
+    // 已经开着就不要再开一层：连按两次 Ctrl+K 应该是"没反应"，
+    // 而不是叠出第二个面板（第二个关掉之后第一个还在，很难受）。
+    if (_paletteOpen) return;
+    _paletteOpen = true;
+    try {
+      final action = await showCommandPalette(context, actions: _buildCommands());
+      if (!mounted || action == null) return;
+
+      await action.run();
+      if (!mounted) return;
+
+      // 面板关掉之后把焦点还回去：默认还给正文，命令也可以指定别的地方
+      // （「搜索日记」的结果就是把光标送进侧栏的搜索框）。否则用户接着打字
+      // 就打进了空气里——「打开即写」这条在项目里踩过一次。
+      //
+      // 必须等这一帧结束再要焦点：此刻对话框还在树上、它的焦点作用域还占着，
+      // 这时候 requestFocus 会被随后到来的卸载吞掉。切日期那条路径
+      // （见 _onControllerChanged）用的是同一个模式。
+      final target = action.focusTarget ?? _bodyFocus;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) target.requestFocus();
+      });
+    } finally {
+      _paletteOpen = false;
+    }
+  }
+
+  /// 对正文当前选区套一对 Markdown 标记；再按一次取消。
+  ///
+  /// 实现和格式条共用 [applyMarkdownFormat] 那一份。
+  void _applyFormat(String open, String close) => applyMarkdownFormat(
+        bodyController: _body,
+        controller: _controller,
+        bodyFocus: _bodyFocus,
+        open: open,
+        close: close,
+      );
+
+  /// 命令面板里能搜到的所有东西。
+  ///
+  /// 这里**不实现任何新能力**：只是把已经存在的动作再列一遍，菜单和按钮一个都
+  /// 不动（新手靠看得见，熟练的人靠搜，两个都要）。所以这张表里的每一行都应该
+  /// 能在界面上找到对应的入口——改功能时两边要一起改，别让它们分叉。
+  ///
+  /// 顺序按用途分组：写作 → 导航 → 外观 → 数据 → 筛选 → 破坏性操作。
+  /// 空查询时列表就是这个顺序，所以它是有意义的，别随手打乱。
+  List<CommandAction> _buildCommands() {
+    final controller = _controller;
+    final settings = widget.settings;
+
+    final hasPastEntries =
+        controller.entries.any((entry) => entry.body.trim().isNotEmpty);
+    final canDelete = !controller.isCurrentEntryEmpty;
+    final filterActive = controller.filter.isActive;
+
+    return <CommandAction>[
+      // ---------------------------------------------------------------- 写作
+      CommandAction(
+        icon: Icons.format_bold,
+        run: () async =>
+            _applyFormat(MarkdownFormatter.bold, MarkdownFormatter.bold),
+        command: const PaletteCommand(
+          id: 'format.bold',
+          title: '加粗',
+          keywords: <String>['加粗', '粗体', 'bold', '格式', 'markdown'],
+          shortcut: 'Ctrl+B',
+        ),
+      ),
+      CommandAction(
+        icon: Icons.format_italic,
+        run: () async =>
+            _applyFormat(MarkdownFormatter.italic, MarkdownFormatter.italic),
+        command: const PaletteCommand(
+          id: 'format.italic',
+          title: '斜体',
+          keywords: <String>['斜体', 'italic', '格式', 'markdown'],
+          shortcut: 'Ctrl+I',
+        ),
+      ),
+      CommandAction(
+        icon: Icons.format_underlined,
+        run: () async => _applyFormat(
+          MarkdownFormatter.underlineOpen,
+          MarkdownFormatter.underlineClose,
+        ),
+        command: const PaletteCommand(
+          id: 'format.underline',
+          title: '下划线',
+          subtitle: '会插入 <u> 标签',
+          keywords: <String>['下划线', 'underline', '格式', 'markdown'],
+          shortcut: 'Ctrl+U',
+        ),
+      ),
+      CommandAction(
+        icon: Icons.lightbulb_outline,
+        run: () async => controller.nextPrompt(),
+        command: PaletteCommand(
+          id: 'prompt.next',
+          title: '换一个写作引子',
+          keywords: const <String>['引子', '问题', '每日一问', '换一个', 'prompt'],
+          enabled: controller.isCurrentEntryEmpty,
+          // 引子只在空白页上出现（有内容之后它就不是障碍了），
+          // 所以"不能换"的真正原因和"今天已经动笔了"是同一件事。
+          disabledReason: '今天已经动笔了，引子不再显示',
+        ),
+      ),
+      CommandAction(
+        icon: Icons.bookmark_add_outlined,
+        run: () async => _snapshotNow(),
+        command: PaletteCommand(
+          id: 'snapshot.now',
+          title: '留一份当前版本',
+          subtitle: '和「历史版本」里的手动快照是同一件事',
+          keywords: const <String>['快照', '版本', '历史', '留一份', 'snapshot'],
+          enabled: controller.hasEntry,
+          disabledReason: '今天还没写过，没有可留的版本',
+        ),
+      ),
+
+      // ---------------------------------------------------------------- 导航
+      CommandAction(
+        icon: Icons.chevron_left,
+        run: () async => controller.shiftDay(-1),
+        command: const PaletteCommand(
+          id: 'nav.prev',
+          title: '前一天',
+          keywords: <String>['前一天', '上一天', '昨天', '上一页', 'previous'],
+        ),
+      ),
+      CommandAction(
+        icon: Icons.chevron_right,
+        run: () async => controller.shiftDay(1),
+        command: const PaletteCommand(
+          id: 'nav.next',
+          title: '后一天',
+          keywords: <String>['后一天', '下一天', '明天', '下一页', 'next'],
+        ),
+      ),
+      CommandAction(
+        icon: Icons.today,
+        run: () async => controller.goToToday(),
+        command: const PaletteCommand(
+          id: 'nav.today',
+          title: '今天',
+          keywords: <String>['今天', '回到今天', '当前', 'today'],
+        ),
+      ),
+      CommandAction(
+        icon: Icons.calendar_month,
+        run: () async => _pickDate(),
+        command: const PaletteCommand(
+          id: 'nav.pickDate',
+          title: '选择日期',
+          keywords: <String>['日期', '日历', '跳转', '选日期', 'calendar'],
+        ),
+      ),
+      CommandAction(
+        icon: Icons.casino_outlined,
+        run: () async => travelToRandomEntryAction(context, controller),
+        command: PaletteCommand(
+          id: 'nav.timeMachine',
+          title: '时光机',
+          subtitle: '随机翻一篇以前写过的日记',
+          keywords: const <String>['时光机', '随机', '翻一篇', '回顾', 'random'],
+          enabled: hasPastEntries,
+          disabledReason: '还没有以前写过的日记可以翻',
+        ),
+      ),
+      CommandAction(
+        icon: Icons.search,
+        // 这条命令的**结果就是**把光标放到侧栏搜索框里，所以焦点目标不是正文。
+        focusTarget: _searchFocus,
+        run: () async => _searchFocus.requestFocus(),
+        command: PaletteCommand(
+          id: 'nav.search',
+          title: '搜索日记',
+          subtitle: '搜正文、标签、心情、天气、日期',
+          keywords: const <String>['搜索', '查找', '全文', 'search', 'find'],
+          enabled: !_zenMode,
+          // 专注模式会把整个侧栏（连同搜索框）从树上摘掉，此时聚焦是空操作。
+          disabledReason: '专注模式隐藏了日记列表',
+        ),
+      ),
+
+      // ---------------------------------------------------------------- 外观
+      for (final mode in AppThemeMode.values)
+        CommandAction(
+          icon: themeModeIcon(mode),
+          run: () async => settings.setThemeMode(mode),
+          command: PaletteCommand(
+            id: 'appearance.${mode.name}',
+            title: '外观：${themeModeLabel(mode)}',
+            subtitle: settings.themeMode == mode ? '当前' : null,
+            keywords: <String>[
+              '外观',
+              '主题',
+              '配色',
+              themeModeLabel(mode),
+              ..._themeKeywords(mode),
+            ],
+          ),
+        ),
+      CommandAction(
+        icon: Icons.format_size,
+        run: () async => showTypographyAction(context, settings),
+        command: PaletteCommand(
+          id: 'appearance.typography',
+          title: '字体与行距',
+          subtitle: '当前字号 ${settings.typography.fontSize.round()} px',
+          keywords: const <String>[
+            '字体',
+            '字号',
+            '行距',
+            '行宽',
+            '字重',
+            '排版',
+            'typography',
+          ],
+        ),
+      ),
+      CommandAction(
+        icon: _zenMode ? Icons.vertical_split : Icons.vertical_split_outlined,
+        run: () async => _toggleZen(),
+        command: PaletteCommand(
+          id: 'view.zen',
+          title: '专注模式',
+          subtitle: _zenMode ? '已开启（隐藏日记列表）' : '隐藏左侧日记列表，全屏写作',
+          keywords: const <String>['专注', '全屏', '隐藏列表', 'zen', 'focus'],
+        ),
+      ),
+
+      // ------------------------------------------------------- 数据与位置
+      CommandAction(
+        icon: Icons.folder_open,
+        run: () async => revealDiaryFolderAction(context, controller),
+        command: const PaletteCommand(
+          id: 'data.folder',
+          title: '打开日记文件夹',
+          keywords: <String>['文件夹', '目录', '资源管理器', 'explorer', 'folder'],
+        ),
+      ),
+      // 预览模式（web）没有可写的文件系统，这一条整个不注册——
+      // 给一个点了会失败的命令，比没有这个命令更糟。
+      if (platform.supportsDiaryLocationChange)
+        CommandAction(
+          icon: Icons.inventory_2_outlined,
+          run: () async => _openLocationDialog(),
+          command: const PaletteCommand(
+            id: 'data.location',
+            title: '日记存储位置',
+            subtitle: '换一个文件夹；只复制，从不移动',
+            keywords: <String>['位置', '目录', '迁移', '存储', '根目录', 'path'],
+          ),
+        ),
+      CommandAction(
+        icon: Icons.ios_share,
+        run: () async => exportDiaryAction(context, controller),
+        command: const PaletteCommand(
+          id: 'data.export',
+          title: '导出为 Markdown',
+          keywords: <String>['导出', 'markdown', 'export', '另存'],
+        ),
+      ),
+      if (platform.supportsBackup)
+        CommandAction(
+          icon: Icons.save_outlined,
+          run: () async => openBackupAction(
+            context,
+            settings: settings,
+            controller: controller,
+          ),
+          command: PaletteCommand(
+            id: 'data.backup',
+            title: '备份',
+            // 备份图标只在"该备份了"的时候才出现在状态栏上，所以那时候反而
+            // 更需要一个随时找得到的入口——这一条就是。
+            subtitle: settings.backupRoot == null
+                ? '还没设备份位置'
+                : '上次备份：${_lastBackupLabel(settings.lastBackupAt)}',
+            keywords: const <String>['备份', '快照', '存档', 'backup'],
+          ),
+        ),
+      CommandAction(
+        icon: Icons.history,
+        run: () async => showHistoryAction(context, controller),
+        command: const PaletteCommand(
+          id: 'data.history',
+          title: '历史版本',
+          subtitle: '查看 / 恢复这一天的历史快照',
+          keywords: <String>['历史', '版本', '快照', '恢复', 'history'],
+        ),
+      ),
+      CommandAction(
+        icon: Icons.restore_from_trash,
+        run: () async => showTrashAction(context, controller),
+        command: const PaletteCommand(
+          id: 'data.trash',
+          title: '回收站',
+          subtitle: '删除是软删除，字节一个不少',
+          keywords: <String>['回收站', '恢复', '垃圾', 'trash'],
+        ),
+      ),
+
+      // ---------------------------------------------------------------- 筛选
+      CommandAction(
+        icon: Icons.filter_list,
+        run: () async => showFilterAction(context, controller),
+        command: PaletteCommand(
+          id: 'filter.open',
+          title: '筛选',
+          subtitle: filterActive ? controller.filter.describe() : null,
+          keywords: const <String>[
+            '筛选',
+            '过滤',
+            '标签',
+            '心情',
+            '天气',
+            'filter',
+          ],
+        ),
+      ),
+      CommandAction(
+        icon: Icons.clear,
+        run: () async => controller.clearFilter(),
+        command: PaletteCommand(
+          id: 'filter.clear',
+          title: '清除筛选',
+          keywords: const <String>['清除筛选', '取消筛选', '重置', 'clear'],
+          enabled: filterActive,
+          disabledReason: '当前没有筛选条件',
+        ),
+      ),
+
+      // ------------------------------------------------------------ 破坏性
+      CommandAction(
+        icon: Icons.delete_forever,
+        run: () async => deleteCurrentEntryAction(context, controller),
+        command: PaletteCommand(
+          id: 'data.delete',
+          title: '删除这一天的日记',
+          subtitle: '移进回收站，内容不会被抹掉',
+          keywords: const <String>['删除', '移除', '回收站', 'delete'],
+          enabled: canDelete,
+          // 和「更多」菜单同一句话：置灰而不是隐藏，并且说明原因。
+          disabledReason: '这一天还没写东西',
+        ),
+      ),
+    ];
+  }
+
+  /// 主题三档各自的别名。中文没有词边界，光靠"浅色/深色"两个词，
+  /// 想切夜间模式的人搜「暗」「夜间」就找不到。
+  List<String> _themeKeywords(AppThemeMode mode) => switch (mode) {
+        AppThemeMode.system => const <String>['跟随系统', '自动', 'system'],
+        AppThemeMode.light => const <String>['浅色', '白天', '亮色', 'light'],
+        AppThemeMode.dark => const <String>['深色', '暗色', '夜间', '黑色', 'dark'],
+      };
+
+  String _lastBackupLabel(DateTime? at) {
+    if (at == null) return '从没成功过';
+    final days = daysSinceBackup(at, DateTime.now());
+    if (days == null) return '从没成功过';
+    return days == 0 ? '今天' : '$days 天前';
+  }
+
+  void _toggleZen() => setState(() => _zenMode = !_zenMode);
+
+  /// 手动留一份版本，并把结果如实说出来。
+  ///
+  /// 「和最新一份完全相同就不重复留」是快照那套策略的一部分，
+  /// 这里必须把它显示出来——否则用户点了没反应，会以为按钮坏了。
+  Future<void> _snapshotNow() async {
+    final messenger = ScaffoldMessenger.of(context);
+    final created = await _controller.saveVersionNow();
+    if (!mounted) return;
+    messenger.showSnackBar(
+      SnackBar(
+        content: Text(created ? '已留一份当前版本。' : '和最新一份完全相同，没有重复留。'),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final controller = _controller;
@@ -259,44 +666,62 @@ class _DiaryHomePageState extends State<DiaryHomePage>
       return const Scaffold(body: Center(child: CircularProgressIndicator()));
     }
 
-    return Scaffold(
-      body: LayoutBuilder(
-        builder: (context, constraints) {
-          // 侧栏固定 320px 在窄窗口下会把写作区挤没
-          final narrow = constraints.maxWidth < 900;
+    // Ctrl+K 绑在这里，不是绑在某个输入框上：键事件从焦点节点向上冒泡，
+    // 这一层在侧栏、正文、心情/天气/标签输入框的**共同祖先**上，
+    // 所以哪个控件有焦点都能唤出面板。
+    //
+    // Ctrl+K 在 Windows 上没有被 Flutter 文本框的默认绑定占用：那套 Emacs 式
+    // 绑定（Ctrl+K 是 kill line）只在 macOS 和 web 上生效——和 Ctrl+B/I/U
+    // 是同一个前提（见 editor_panel 里的说明）。
+    // ⚠️ 唯一的例外是浏览器预览：`flutter run -d chrome` 下 Ctrl+K 会被
+    // 文本框吃掉，那是预览环境，不是目标形态。
+    return CallbackShortcuts(
+      bindings: <ShortcutActivator, VoidCallback>{
+        const SingleActivator(LogicalKeyboardKey.keyK, control: true):
+            () => unawaited(_openCommandPalette()),
+      },
+      child: Scaffold(
+        body: LayoutBuilder(
+          builder: (context, constraints) {
+            // 侧栏固定 320px 在窄窗口下会把写作区挤没
+            final narrow = constraints.maxWidth < 900;
 
-          return Row(
-            children: <Widget>[
-              if (!_zenMode) ...<Widget>[
-                SizedBox(
-                  width: narrow ? 250 : 320,
-                  child: EntryListPanel(
+            return Row(
+              children: <Widget>[
+                if (!_zenMode) ...<Widget>[
+                  SizedBox(
+                    width: narrow ? 250 : 320,
+                    child: EntryListPanel(
+                      controller: controller,
+                      onPickDate: _pickDate,
+                      searchFocus: _searchFocus,
+                    ),
+                  ),
+                  const VerticalDivider(width: 1),
+                ],
+                Expanded(
+                  child: EditorPanel(
                     controller: controller,
+                    settings: widget.settings,
+                    bodyController: _body,
+                    bodyFocus: _bodyFocus,
+                    zenMode: _zenMode,
                     onPickDate: _pickDate,
+                    onToggleZen: _toggleZen,
+                    onOpenCommandPalette:
+                        () => unawaited(_openCommandPalette()),
+                    // 「日记位置」从左侧栏底部移到了这里。顺带一个好处：
+                    // 专注模式会隐藏左侧栏，以前那种状态下就没法改位置了。
+                    onOpenLocationSettings:
+                        platform.supportsDiaryLocationChange
+                            ? _openLocationDialog
+                            : null,
                   ),
                 ),
-                const VerticalDivider(width: 1),
               ],
-              Expanded(
-                child: EditorPanel(
-                  controller: controller,
-                  settings: widget.settings,
-                  bodyController: _body,
-                  bodyFocus: _bodyFocus,
-                  zenMode: _zenMode,
-                  onPickDate: _pickDate,
-                  onToggleZen: () => setState(() => _zenMode = !_zenMode),
-                  // 「日记位置」从左侧栏底部移到了这里。顺带一个好处：
-                  // 专注模式会隐藏左侧栏，以前那种状态下就没法改位置了。
-                  onOpenLocationSettings:
-                      platform.supportsDiaryLocationChange
-                          ? _openLocationDialog
-                          : null,
-                ),
-              ),
-            ],
-          );
-        },
+            );
+          },
+        ),
       ),
     );
   }

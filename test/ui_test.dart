@@ -1499,4 +1499,233 @@ void main() {
       expect(brightnessOf(tester), Brightness.dark);
     });
   });
+
+  group('命令面板', () {
+    const queryField = Key('command-palette-query');
+
+    Brightness brightnessOf(WidgetTester tester) =>
+        Theme.of(tester.element(find.byKey(bodyField))).brightness;
+
+    Finder searchField() => find.byWidgetPredicate(
+          (widget) =>
+              widget is TextField &&
+              widget.decoration?.hintText == '搜索日记…',
+        );
+
+    bool searchHasFocus(WidgetTester tester) =>
+        tester.widget<TextField>(searchField()).focusNode?.hasFocus ?? false;
+
+    bool bodyHasFocus(WidgetTester tester) =>
+        tester.widget<TextField>(find.byKey(bodyField)).focusNode?.hasFocus ??
+        false;
+
+    /// 面板输入框用的是 `autofocus`，所以 `TextField.focusNode` 是 null。
+    /// 要判断它有没有焦点，得问真正持有焦点的那个 `EditableText`。
+    bool queryHasFocus(WidgetTester tester) => tester
+        .widget<EditableText>(find.descendant(
+          of: find.byKey(queryField),
+          matching: find.byType(EditableText),
+        ))
+        .focusNode
+        .hasFocus;
+
+    /// 按 Ctrl+K。
+    ///
+    /// 用真实的按键事件而不是直接调 `_openCommandPalette`：这一条要验的正是
+    /// "键事件能不能从当前有焦点的控件冒泡到根部那一层"。
+    Future<void> pressCtrlK(WidgetTester tester) async {
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+      await tester.sendKeyEvent(LogicalKeyboardKey.keyK);
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+      await tester.pumpAndSettle();
+    }
+
+    /// 在面板的输入框里按回车。
+    ///
+    /// 必须走 `receiveAction` 而不是发一个 Enter 按键：单行文本框的提交是
+    /// 输入法动作（`TextInputAction`），不是键事件——测试环境里没有真的输入法，
+    /// 发按键不会有任何反应。
+    Future<void> pressEnter(WidgetTester tester) async {
+      await tester.testTextInput.receiveAction(TextInputAction.done);
+      await tester.pumpAndSettle();
+    }
+
+    Future<void> typeQuery(WidgetTester tester, String text) async {
+      await tester.enterText(find.byKey(queryField), text);
+      await tester.pumpAndSettle();
+    }
+
+    testWidgets('Ctrl+K 能唤出面板，输入筛选后回车就真的执行了', (tester) async {
+      final store = MemoryDiaryStore();
+      store.seed(DiaryEntry.create(
+          date: DateTime(2026, 10, 3), device: 'test', body: '三号的内容'));
+      store.seed(DiaryEntry.create(
+          date: DateTime(2026, 10, 4), device: 'test', body: '四号的内容'));
+      await pumpApp(tester, store, date: DateTime(2026, 10, 4));
+
+      expect(find.byKey(queryField), findsNothing);
+
+      await pressCtrlK(tester);
+      expect(find.byKey(queryField), findsOneWidget);
+      // 面板一开，光标应该在它自己的输入框里，用户可以直接打字
+      expect(queryHasFocus(tester), isTrue);
+
+      await typeQuery(tester, '前一天');
+      await pressEnter(tester);
+
+      // 面板关掉，并且命令真的执行了：翻到了前一天
+      expect(find.byKey(queryField), findsNothing);
+      expect(
+        tester
+            .widget<TextField>(find.byKey(bodyField))
+            .controller
+            ?.text,
+        '三号的内容',
+      );
+    });
+
+    testWidgets('面板的输入框不和正文共用一个 controller，关掉后焦点回到正文', (tester) async {
+      await pumpApp(tester, MemoryDiaryStore());
+      await tester.enterText(find.byKey(bodyField), '正文里的字');
+      await tester.pump();
+
+      await pressCtrlK(tester);
+      await typeQuery(tester, '今天');
+
+      // 在面板里打字，正文一个字都不该变
+      expect(
+        tester.widget<TextField>(find.byKey(bodyField)).controller?.text,
+        '正文里的字',
+        reason: '面板有它自己的输入框，不能和正文共用 controller',
+      );
+
+      // Esc 关掉（这条也顺带说明：Esc 能关面板）
+      await tester.sendKeyEvent(LogicalKeyboardKey.escape);
+      await tester.pumpAndSettle();
+      expect(find.byKey(queryField), findsNothing);
+
+      // 关掉之后必须能接着写：焦点要回到正文，否则用户打的第一句会掉进空气里
+      await tester.pumpAndSettle();
+      expect(bodyHasFocus(tester), isTrue);
+    });
+
+    testWidgets('方向键能移动选择：向下一次再回车，执行的是第二条', (tester) async {
+      await pumpApp(tester, MemoryDiaryStore());
+
+      await pressCtrlK(tester);
+      // 「外观：」命中三条，按相关度排是 浅色 → 深色 → 跟随系统
+      // （浅色和深色同分，按注册顺序）
+      await typeQuery(tester, '外观：');
+
+      // 先确认默认落在第一条：直接回车应该是浅色
+      await tester.sendKeyEvent(LogicalKeyboardKey.arrowDown);
+      await tester.pumpAndSettle();
+      await pressEnter(tester);
+
+      expect(brightnessOf(tester), Brightness.dark,
+          reason: '按了一次下键，执行的应该是第二条（深色）而不是第一条（浅色）');
+    });
+
+    testWidgets('按钮也是入口：只留快捷键等于没有入口', (tester) async {
+      await pumpApp(tester, MemoryDiaryStore());
+
+      await tester.tap(find.byTooltip('命令面板（Ctrl+K）'));
+      await tester.pumpAndSettle();
+
+      expect(find.byKey(queryField), findsOneWidget);
+    });
+
+    testWidgets('侧栏搜索框有焦点时，Ctrl+K 照样能唤出面板', (tester) async {
+      // 这一条守的是面板挂在 HomePage 而不是 EditorPanel 的决定：
+      // 键事件只向上冒泡，挂在写作区里面就够不到侧栏。
+      await pumpApp(tester, MemoryDiaryStore());
+
+      await tester.tap(searchField());
+      await tester.pumpAndSettle();
+      expect(searchHasFocus(tester), isTrue);
+
+      await pressCtrlK(tester);
+      expect(find.byKey(queryField), findsOneWidget);
+    });
+
+    testWidgets('「搜索日记」把光标送进搜索框，而不是还回正文', (tester) async {
+      await pumpApp(tester, MemoryDiaryStore());
+
+      await pressCtrlK(tester);
+      await typeQuery(tester, '搜索日记');
+      await pressEnter(tester);
+
+      expect(searchHasFocus(tester), isTrue);
+      expect(bodyHasFocus(tester), isFalse);
+    });
+
+    testWidgets('禁用的命令看得见、点不动，并且写着原因', (tester) async {
+      // 空日记那一天，「删除这一天的日记」是禁用的。
+      // 项目原则是**禁用而不是隐藏**，所以它必须出现在搜索结果里，
+      // 而且"为什么不能点"要写在它自己那一行上。
+      await pumpApp(tester, MemoryDiaryStore());
+
+      await pressCtrlK(tester);
+      await typeQuery(tester, '删除');
+
+      expect(find.byKey(const ValueKey<String>('command-data.delete')),
+          findsOneWidget);
+      expect(find.text('这一天还没写东西'), findsOneWidget);
+
+      await pressEnter(tester);
+
+      // 禁用项按回车什么都不该发生：面板还开着，更不能弹出删除确认框
+      expect(find.byKey(queryField), findsOneWidget);
+      expect(find.text('删除这一天的日记？'), findsNothing);
+    });
+
+    testWidgets('面板开着时再按 Ctrl+K 不会叠出第二层', (tester) async {
+      // 对话框是另一条路由，键事件不会冒泡回 HomePage 那一层，所以这一条
+      // 验的是两层保护都在：路由的隔离 + `_paletteOpen` 那个守卫。
+      await pumpApp(tester, MemoryDiaryStore());
+
+      await pressCtrlK(tester);
+      expect(find.byKey(queryField), findsOneWidget);
+
+      await pressCtrlK(tester);
+      expect(find.byKey(queryField), findsOneWidget,
+          reason: '叠出两层的话，关掉上面那层会露出下面那层，很难受');
+    });
+
+    testWidgets('禁用项点不动：鼠标点它同样不执行', (tester) async {
+      // 回车那条路径已经测过了（`_run` 里的判断）。这一条补上鼠标那条：
+      // 行的 `onTap` 是 null，而不是"点了之后在别处被拦下来"。
+      await pumpApp(tester, MemoryDiaryStore());
+
+      await pressCtrlK(tester);
+      await typeQuery(tester, '删除');
+
+      await tester.tap(find.byKey(const ValueKey<String>('command-data.delete')));
+      await tester.pumpAndSettle();
+
+      expect(find.byKey(queryField), findsOneWidget);
+      expect(find.text('删除这一天的日记？'), findsNothing);
+    });
+
+    testWidgets('从面板删除这一天，确认框照样会拦一道', (tester) async {
+      // 命令面板是"第二道门"，不是"后门"：删除必须仍然走确认。
+      final store = MemoryDiaryStore();
+      store.seed(DiaryEntry.create(
+          date: DateTime(2026, 10, 4), device: 'test', body: '要被删掉的内容'));
+      final controller =
+          await pumpApp(tester, store, date: DateTime(2026, 10, 4));
+
+      await pressCtrlK(tester);
+      await typeQuery(tester, '删除');
+      await pressEnter(tester);
+
+      expect(find.text('删除这一天的日记？'), findsOneWidget);
+
+      await tester.tap(find.text('取消'));
+      await tester.pumpAndSettle();
+
+      expect(controller.body, '要被删掉的内容');
+      expect(await store.loadByDate(DateTime(2026, 10, 4)), isNotNull);
+    });
+  });
 }

@@ -77,10 +77,17 @@ class EntryListPanel extends StatefulWidget {
     super.key,
     required this.controller,
     required this.onPickDate,
+    this.searchFocus,
   });
 
   final DiaryController controller;
   final VoidCallback onPickDate;
+
+  /// 搜索框的焦点节点，由上层持有。
+  ///
+  /// 为什么不由这里自己建：命令面板的「搜索日记」要能把光标送进这个输入框，
+  /// 而面板挂在 `HomePage` 上——它是这一层的**兄弟**，够不到这里的私有状态。
+  final FocusNode? searchFocus;
 
   @override
   State<EntryListPanel> createState() => _EntryListPanelState();
@@ -211,6 +218,7 @@ class _EntryListPanelState extends State<EntryListPanel> {
             children: <Widget>[
               TextField(
                 controller: _search,
+                focusNode: widget.searchFocus,
                 decoration: InputDecoration(
                   isDense: true,
                   hintText: '搜索日记…',

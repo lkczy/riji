@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -7,12 +9,9 @@ import '../data/settings.dart';
 import '../platform/platform.dart' as platform;
 import '../state/diary_controller.dart';
 import '../state/settings_controller.dart';
-import 'backup_dialog.dart';
+import 'diary_actions.dart';
 import 'markdown_formatting.dart';
-import 'history_dialog.dart';
 import 'theme.dart';
-import 'trash_dialog.dart';
-import 'typography_dialog.dart';
 
 /// 「外观」菜单里的动作。主题三档和字体设置放在同一个菜单里——
 /// 它们都是"看着舒服"这一类的事，没必要再占一个标题栏图标。
@@ -40,6 +39,7 @@ class EditorPanel extends StatefulWidget {
     required this.zenMode,
     required this.onPickDate,
     required this.onToggleZen,
+    required this.onOpenCommandPalette,
     this.onOpenLocationSettings,
   });
 
@@ -50,6 +50,10 @@ class EditorPanel extends StatefulWidget {
   final bool zenMode;
   final VoidCallback onPickDate;
   final VoidCallback onToggleZen;
+
+  /// 唤出命令面板。面板本身挂在 `HomePage` 上——它必须在侧栏搜索框有焦点时
+  /// 也能唤出，而侧栏和写作区是兄弟，这一层管不到它。这里只是它的一个入口。
+  final VoidCallback onOpenCommandPalette;
 
   /// 打开「日记位置」对话框。为 null 时不显示这一项
   /// （web 预览没有文件系统，不支持改位置）。
@@ -279,34 +283,10 @@ class _EditorPanelState extends State<EditorPanel> {
   }
 
   /// 时光机：随机翻到一篇以前写过的日记。
-  Future<void> _travelToRandomEntry() async {
-    if (!mounted) return;
-    final messenger = ScaffoldMessenger.of(context);
-
-    final entry = _controller.pickRandomEntry();
-    if (entry == null) {
-      messenger.showSnackBar(
-        const SnackBar(content: Text('还没有以前写过的日记可以翻。')),
-      );
-      return;
-    }
-
-    await _controller.openDate(entry.date);
-    if (!mounted) return;
-
-    // 连续点「再翻一篇」时不要排队堆一堆提示
-    messenger.removeCurrentSnackBar();
-    messenger.showSnackBar(
-      SnackBar(
-        content: Text('时光机：翻到了 ${formatIsoDate(entry.date)}'),
-        duration: const Duration(seconds: 6),
-        action: SnackBarAction(
-          label: '再翻一篇',
-          onPressed: _travelToRandomEntry,
-        ),
-      ),
-    );
-  }
+  ///
+  /// 实现只在 [travelToRandomEntryAction] 里有一份——命令面板也调它。
+  Future<void> _travelToRandomEntry() =>
+      travelToRandomEntryAction(context, _controller);
 
   /// 外观切换（主题 + 字体）。
   ///
@@ -342,10 +322,7 @@ class _EditorPanelState extends State<EditorPanel> {
         // 先让菜单的关闭动画走完再开对话框，否则对话框会叠在菜单遮罩上。
         WidgetsBinding.instance.addPostFrameCallback((_) {
           if (!mounted) return;
-          showDialog<void>(
-            context: context,
-            builder: (_) => TypographyDialog(settings: settings),
-          );
+          unawaited(showTypographyAction(context, settings));
         });
       },
       itemBuilder: (context) => <PopupMenuEntry<_AppearanceAction>>[
@@ -808,20 +785,15 @@ class _EditorPanelState extends State<EditorPanel> {
   }
 
   /// 对当前选区套用一对标记；再按一次取消。
-  void _applyFormat(String open, String close) {
-    final updated = MarkdownFormatter.toggleWrap(
-      widget.bodyController.value,
-      open: open,
-      close: close,
-    );
-    if (updated == widget.bodyController.value) return;
-
-    widget.bodyController.value = updated;
-    // 直接改 controller 不会触发 TextField 的 onChanged，所以必须手动通知一次。
-    // 漏掉这一步的表现是：格式改了，但不会被保存——下次打开发现改动没了。
-    _controller.updateBody(updated.text);
-    widget.bodyFocus.requestFocus();
-  }
+  ///
+  /// 实现只在 [applyMarkdownFormat] 里有一份——命令面板也调它。
+  void _applyFormat(String open, String close) => applyMarkdownFormat(
+        bodyController: widget.bodyController,
+        controller: _controller,
+        bodyFocus: widget.bodyFocus,
+        open: open,
+        close: close,
+      );
 
   Widget _buildWritingArea(BuildContext context) {
     final typography = widget.settings.typography;
@@ -930,6 +902,20 @@ class _EditorPanelState extends State<EditorPanel> {
               overflow: TextOverflow.ellipsis,
             ),
           ),
+          // 命令面板的入口。
+          //
+          // 面板本身靠 Ctrl+K 就能开，但**只留快捷键等于没有入口**：没人会去猜
+          // 一个看不见的功能。按钮和快捷键两个都要（格式条那边已经写过同一条）。
+          //
+          // 图标刻意复用已经在用的 `search`：这个项目的图标字体是按用到的字形
+          // 裁剪的，新图标出问题只在 release 构建里暴露成空白方块
+          // （见 docs/开发须知.md 第 1.1 条）。语义靠 tooltip 补足。
+          IconButton(
+            tooltip: '命令面板（Ctrl+K）',
+            visualDensity: VisualDensity.compact,
+            onPressed: widget.onOpenCommandPalette,
+            icon: const Icon(Icons.search, size: 18),
+          ),
           if (_showBackupWarning()) _buildBackupWarning(context),
           const SizedBox(width: 8),
           _buildMoreMenu(context),
@@ -969,11 +955,11 @@ class _EditorPanelState extends State<EditorPanel> {
         size: 18,
         color: theme.colorScheme.error,
       ),
-      onPressed: () => showBackupDialog(
+      onPressed: () => unawaited(openBackupAction(
         context,
         settings: widget.settings,
         controller: _controller,
-      ),
+      )),
     );
   }
 
@@ -1058,17 +1044,16 @@ class _EditorPanelState extends State<EditorPanel> {
     );
   }
 
+  /// 打开文件夹、备份、历史版本、回收站、导出、删除都转交给 [diary_actions]。
+  ///
+  /// 这一层只负责"菜单点了哪一项"，不负责动作本身怎么实现——因为命令面板
+  /// 要执行同一批动作，实现必须只有一份。
   Future<void> _handleMoreAction(_MoreAction action) async {
     switch (action) {
       case _MoreAction.openFolder:
-        final messenger = ScaffoldMessenger.of(context);
-        try {
-          await _controller.revealDiaryFolder();
-        } catch (error) {
-          messenger.showSnackBar(SnackBar(content: Text('打开文件夹失败：$error')));
-        }
+        await revealDiaryFolderAction(context, _controller);
       case _MoreAction.backup:
-        await showBackupDialog(
+        await openBackupAction(
           context,
           settings: widget.settings,
           controller: _controller,
@@ -1076,63 +1061,14 @@ class _EditorPanelState extends State<EditorPanel> {
       case _MoreAction.location:
         widget.onOpenLocationSettings?.call();
       case _MoreAction.export:
-        await _export();
+        await exportDiaryAction(context, _controller);
       case _MoreAction.history:
-        final messenger = ScaffoldMessenger.of(context);
-        final message = await showDialog<String>(
-          context: context,
-          builder: (_) => HistoryDialog(controller: _controller),
-        );
-        if (message != null && message.isNotEmpty) {
-          messenger.showSnackBar(SnackBar(content: Text(message)));
-        }
+        await showHistoryAction(context, _controller);
       case _MoreAction.trash:
-        final messenger = ScaffoldMessenger.of(context);
-        final message = await showDialog<String>(
-          context: context,
-          builder: (_) => TrashDialog(controller: _controller),
-        );
-        if (message != null && message.isNotEmpty) {
-          messenger.showSnackBar(SnackBar(content: Text(message)));
-        }
+        await showTrashAction(context, _controller);
       case _MoreAction.delete:
-        await _confirmDelete();
+        await deleteCurrentEntryAction(context, _controller);
     }
-  }
-
-  Future<void> _confirmDelete() async {
-    final messenger = ScaffoldMessenger.of(context);
-    final date = _controller.selectedDate;
-
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('删除这一天的日记？'),
-        content: Text(
-          '${formatIsoDate(date)} 的这一篇会被移进回收站。\n\n'
-          '**内容不会被抹掉**，你可以随时在「回收站」里把它找回来。',
-        ),
-        actions: <Widget>[
-          TextButton(
-            onPressed: () => Navigator.of(context).pop(false),
-            child: const Text('取消'),
-          ),
-          FilledButton(
-            style: FilledButton.styleFrom(
-              backgroundColor: Theme.of(context).colorScheme.error,
-            ),
-            onPressed: () => Navigator.of(context).pop(true),
-            child: const Text('删除'),
-          ),
-        ],
-      ),
-    );
-    if (confirmed != true) return;
-
-    await _controller.deleteCurrentEntry();
-    messenger.showSnackBar(
-      SnackBar(content: Text('已删除 ${formatIsoDate(date)} 的日记，可在「回收站」里找回。')),
-    );
   }
 
   Widget _buildSaveIndicator(BuildContext context) {
@@ -1205,22 +1141,4 @@ class _EditorPanelState extends State<EditorPanel> {
       '${value.hour.toString().padLeft(2, '0')}:'
       '${value.minute.toString().padLeft(2, '0')}:'
       '${value.second.toString().padLeft(2, '0')}';
-
-  Future<void> _export() async {
-    final messenger = ScaffoldMessenger.of(context);
-    try {
-      final path = await _controller.exportAsMarkdown();
-      messenger.showSnackBar(
-        SnackBar(
-          content: Text('已导出到：$path'),
-          action: SnackBarAction(
-            label: '打开位置',
-            onPressed: () => _controller.revealLastExport(),
-          ),
-        ),
-      );
-    } catch (error) {
-      messenger.showSnackBar(SnackBar(content: Text('导出失败：$error')));
-    }
-  }
 }
