@@ -2,7 +2,7 @@ name: riji
 description: "日迹 —— 一个把日记存成 Markdown 文件的本地日记程序。"
 publish_to: 'none'
 
-version: 1.0.0
+version: 1.1.0
 
 environment:
   sdk: ^3.13.4
