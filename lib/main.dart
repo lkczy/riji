@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 
+import 'data/release_info.dart';
 import 'data/settings.dart';
 import 'core/diary_location.dart';
 import 'platform/platform.dart' as platform;
@@ -28,6 +29,7 @@ class RijiBootstrap extends StatefulWidget {
 class _RijiBootstrapState extends State<RijiBootstrap> {
   DiaryController? _controller;
   SettingsController? _settings;
+  ReleaseInfo? _releaseInfo;
   Object? _error;
   bool _alreadyRunning = false;
 
@@ -64,14 +66,22 @@ class _RijiBootstrapState extends State<RijiBootstrap> {
       );
       final controller = DiaryController(store: store, deviceName: device);
 
+      // 版本与更新记录：和读日记**并行**，不拖慢启动。
+      // 读不到就是 null，界面那边整个功能不出现——它是锦上添花，
+      // 绝不能挡住"打开即写"。
+      final releaseInfoFuture = loadReleaseInfo();
+
       // 不等它读完就先把窗口显示出来，读取过程由界面上的加载态体现。
       // 「打开即写」意味着启动不能有等待感。
       unawaited(controller.load());
+
+      final releaseInfo = await releaseInfoFuture;
 
       if (!mounted) return;
       setState(() {
         _settings = settings;
         _controller = controller;
+        _releaseInfo = releaseInfo;
       });
     } catch (error) {
       if (!mounted) return;
@@ -213,6 +223,7 @@ class _RijiBootstrapState extends State<RijiBootstrap> {
       controller: controller,
       settings: settings,
       onSwitchDiaryRoot: _switchDiaryRoot,
+      releaseInfo: _releaseInfo,
     );
   }
 }

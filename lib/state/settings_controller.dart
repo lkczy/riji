@@ -116,4 +116,23 @@ class SettingsController extends ChangeNotifier {
     notifyListeners();
     await repository.save(_settings);
   }
+
+  // ---------------------------------------------------------------------------
+  // 「本版更新」
+  // ---------------------------------------------------------------------------
+
+  /// 上一次启动时见到的版本号。null 表示第一次装。
+  String? get lastSeenVersion => _settings.lastSeenVersion;
+
+  /// 记下「这个版本已经见过了」。
+  ///
+  /// **无论弹窗弹没弹都要记**：记不下来的话用户每次启动都会被问一遍——
+  /// 那是最糟的失败方式，因为用户会学会无脑点掉，真正的提示反而被忽略。
+  Future<void> noteVersionSeen(String version) async {
+    final normalized = version.trim();
+    if (normalized.isEmpty || normalized == _settings.lastSeenVersion) return;
+    _settings = _settings.copyWith(lastSeenVersion: normalized);
+    notifyListeners();
+    await repository.save(_settings);
+  }
 }

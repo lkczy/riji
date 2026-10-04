@@ -31,6 +31,9 @@ enum AppThemeMode {
 /// 刻意只存「程序需要知道、而日记文件本身不包含」的东西。
 /// 例如「上次看到哪一天」就不存：启动本来就该打开今天，
 /// 存了只是多一处可能写坏的状态，也多一个测试会污染真实配置的入口。
+///
+/// 唯一一处按这条标准仍然要存的是 [lastSeenVersion]：它没有别的来源，
+/// 而"只在升级后弹一次"这件事离开持久化就做不到。见那个字段的注释。
 class AppSettings {
   const AppSettings({
     required this.diaryRoot,
@@ -39,6 +42,7 @@ class AppSettings {
     this.backupRoot,
     this.lastBackupAt,
     this.lastBackupError,
+    this.lastSeenVersion,
   });
 
   final String diaryRoot;
@@ -58,6 +62,16 @@ class AppSettings {
   /// 如果只写进日志，用户会以为备份一直是好的。
   final String? lastBackupError;
 
+  /// 上一次启动时见到的版本号。用来判断"这次是不是刚从旧版升上来"。
+  ///
+  /// 为什么这一个字段值得破例存下来（见类注释里那条标准）：
+  /// 「本版更新」只在**升级后的第一次启动**弹一次，而"上次见到的是哪一版"
+  /// 没有第二个来源——不存就只能每次都弹，那比不弹更糟（用户会学会无脑点掉，
+  /// 真正的提示反而被忽略）。
+  ///
+  /// null 表示**第一次装**：此时不弹（没有"上一版"可比），只把当前版本记下来。
+  final String? lastSeenVersion;
+
   AppSettings copyWith({
     String? diaryRoot,
     AppThemeMode? themeMode,
@@ -65,6 +79,7 @@ class AppSettings {
     String? backupRoot,
     DateTime? lastBackupAt,
     String? lastBackupError,
+    String? lastSeenVersion,
     bool clearBackupError = false,
   }) =>
       AppSettings(
@@ -75,6 +90,7 @@ class AppSettings {
         lastBackupAt: lastBackupAt ?? this.lastBackupAt,
         lastBackupError:
             clearBackupError ? null : (lastBackupError ?? this.lastBackupError),
+        lastSeenVersion: lastSeenVersion ?? this.lastSeenVersion,
       );
 
   Map<String, dynamic> toJson() => <String, dynamic>{
@@ -86,6 +102,7 @@ class AppSettings {
         if (lastBackupAt != null)
           'lastBackupAt': lastBackupAt!.toIso8601String(),
         if (lastBackupError != null) 'lastBackupError': lastBackupError,
+        if (lastSeenVersion != null) 'lastSeenVersion': lastSeenVersion,
       };
 
   static AppSettings fromJson(
@@ -101,6 +118,7 @@ class AppSettings {
     final backupRoot = json['backupRoot'];
     final backupAt = json['lastBackupAt'];
     final backupError = json['lastBackupError'];
+    final lastSeen = json['lastSeenVersion'];
 
     return AppSettings(
       diaryRoot:
@@ -117,6 +135,9 @@ class AppSettings {
           backupError is String && backupError.trim().isNotEmpty
               ? backupError
               : null,
+      // 读不懂就当第一次装：**少弹一次**永远比弹错好
+      lastSeenVersion:
+          lastSeen is String && lastSeen.trim().isNotEmpty ? lastSeen : null,
     );
   }
 }

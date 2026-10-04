@@ -9,6 +9,8 @@ import '../core/backup.dart';
 import '../core/command_palette.dart';
 import '../core/day.dart';
 import '../core/diary_location.dart';
+import '../core/release_notes.dart';
+import '../data/release_info.dart';
 import '../data/settings.dart';
 import '../platform/platform.dart' as platform;
 import '../state/diary_controller.dart';
@@ -21,6 +23,7 @@ import 'entry_list_panel.dart';
 import 'markdown_formatting.dart';
 import 'prompts.dart';
 import 'theme.dart';
+import 'whats_new_dialog.dart';
 
 class DiaryHomePage extends StatefulWidget {
   const DiaryHomePage({
@@ -28,11 +31,15 @@ class DiaryHomePage extends StatefulWidget {
     required this.controller,
     required this.settings,
     required this.onSwitchDiaryRoot,
+    this.releaseInfo,
   });
 
   final DiaryController controller;
   final SettingsController settings;
   final SwitchDiaryRootCallback onSwitchDiaryRoot;
+
+  /// 版本与更新记录。可空——读不到就没有「本版更新」这件事。
+  final ReleaseInfo? releaseInfo;
 
   @override
   State<DiaryHomePage> createState() => _DiaryHomePageState();
@@ -91,7 +98,14 @@ class _DiaryHomePageState extends State<DiaryHomePage>
     if (!_controller.isLoading) {
       _promptsShown = true;
       WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (mounted) unawaited(showStartupPrompts(context, _controller));
+        if (mounted) {
+          unawaited(showStartupPrompts(
+            context,
+            _controller,
+            settings: widget.settings,
+            releaseInfo: widget.releaseInfo,
+          ));
+        }
       });
     }
   }
@@ -118,7 +132,12 @@ class _DiaryHomePageState extends State<DiaryHomePage>
       _bodyFocus.requestFocus();
       if (!widget.controller.isLoading) {
         _promptsShown = true;
-        unawaited(showStartupPrompts(context, widget.controller));
+        unawaited(showStartupPrompts(
+          context,
+          widget.controller,
+          settings: widget.settings,
+          releaseInfo: widget.releaseInfo,
+        ));
       }
     });
   }
@@ -233,7 +252,14 @@ class _DiaryHomePageState extends State<DiaryHomePage>
     if (!controller.isLoading && !_promptsShown) {
       _promptsShown = true;
       WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (mounted) unawaited(showStartupPrompts(context, controller));
+        if (mounted) {
+          unawaited(showStartupPrompts(
+            context,
+            controller,
+            settings: widget.settings,
+            releaseInfo: widget.releaseInfo,
+          ));
+        }
       });
     }
 
@@ -314,6 +340,13 @@ class _DiaryHomePageState extends State<DiaryHomePage>
         close: close,
       );
 
+  /// 当前这一版要显示给用户的更新内容；没有就是 null。
+  ReleaseNotes? get _releaseNotes {
+    final release = widget.releaseInfo;
+    if (release == null) return null;
+    return release.changeLog.forVersion(release.version);
+  }
+
   /// 命令面板里能搜到的所有东西。
   ///
   /// 这里**不实现任何新能力**：只是把已经存在的动作再列一遍，菜单和按钮一个都
@@ -330,6 +363,9 @@ class _DiaryHomePageState extends State<DiaryHomePage>
         controller.entries.any((entry) => entry.body.trim().isNotEmpty);
     final canDelete = !controller.isCurrentEntryEmpty;
     final filterActive = controller.filter.isActive;
+
+    final release = widget.releaseInfo;
+    final releaseNotes = _releaseNotes;
 
     return <CommandAction>[
       // ---------------------------------------------------------------- 写作
@@ -608,6 +644,34 @@ class _DiaryHomePageState extends State<DiaryHomePage>
           disabledReason: '当前没有筛选条件',
         ),
       ),
+
+      // ------------------------------------------------------------ 帮助
+      // 弹窗只在升级后弹一次，所以必须留一个随时能再打开的入口——
+      // 做得出来却找不到，等于没做（这条在项目里反复出现过）。
+      if (release != null)
+        CommandAction(
+          icon: Icons.history,
+          run: () async {
+            final notes = releaseNotes;
+            if (notes != null) await showWhatsNewDialog(context, notes);
+          },
+          command: PaletteCommand(
+            id: 'help.whatsNew',
+            title: '本版更新',
+            subtitle: '日迹 ${release.version}',
+            keywords: const <String>[
+              '更新',
+              '版本',
+              '新功能',
+              '修复',
+              '更新记录',
+              'changelog',
+            ],
+            // 这一版没有写给用户看的内容时置灰，而不是点了没反应
+            enabled: releaseNotes != null,
+            disabledReason: '这一版没有写给用户看的更新内容',
+          ),
+        ),
 
       // ------------------------------------------------------------ 破坏性
       CommandAction(

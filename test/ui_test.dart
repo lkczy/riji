@@ -12,7 +12,9 @@ import 'package:riji/core/diary_location.dart';
 import 'package:riji/core/editor_typography.dart';
 import 'package:riji/core/huangli.dart';
 import 'package:riji/core/models/diary_entry.dart';
+import 'package:riji/core/release_notes.dart';
 import 'package:riji/data/diary_store.dart';
+import 'package:riji/data/release_info.dart';
 import 'package:riji/data/settings.dart';
 import 'package:riji/state/diary_controller.dart';
 import 'package:riji/state/settings_controller.dart';
@@ -48,6 +50,7 @@ void main() {
     DateTime? date,
     Size size = const Size(1400, 900),
     SettingsController? settings,
+    ReleaseInfo? releaseInfo,
   }) async {
     // 显式指定窗口尺寸：默认的 800x600 会让标题栏走窄屏分支，
     // 日期格式随之改变，断言就会对不上。桌面 App 的典型尺寸是宽屏。
@@ -65,6 +68,9 @@ void main() {
         controller: controller,
         settings:
             settings ?? SettingsController(initial: baseSettings),
+        // 不传就当作"读不到版本信息"：此时「本版更新」整个功能不出现。
+        // 现有测试全部走这条路，所以它们的行为一点没变。
+        releaseInfo: releaseInfo,
         onSwitchDiaryRoot: (newRoot, {required copyExisting}) async =>
             const DiaryCopyOutcome(
           ok: false,
@@ -1726,6 +1732,228 @@ void main() {
 
       expect(controller.body, '要被删掉的内容');
       expect(await store.loadByDate(DateTime(2026, 10, 4)), isNotNull);
+    });
+  });
+
+  group('本版更新', () {
+    /// 一份小的合成更新记录。用合成文本而不是真实 CHANGELOG：
+    /// 真实文件的内容会变，而这些测试要固定的是**行为**。
+    const changelog = '''
+# 更新记录
+
+## 1.1.0 — 2026-10-03
+
+### 新功能
+
+- 命令面板：按 `Ctrl+K` 唤起
+- 行尾显示**快捷键**
+
+### 修复
+
+- 修好了切日期时正文被清空
+
+### 内部
+
+- 这条不该进弹窗
+
+## 1.0.0 — 2026-10-02
+
+### 写作
+
+- 这节不是给用户看的
+''';
+
+    ReleaseInfo infoFor(String version) =>
+        ReleaseInfo(version: version, changeLog: ChangeLog.parse(changelog));
+
+    SettingsController settingsWith(
+      String? lastSeen, {
+      SettingsRepository? repository,
+    }) =>
+        SettingsController(
+          initial: AppSettings(
+            diaryRoot: 'memory',
+            lastSeenVersion: lastSeen,
+          ),
+          repository: repository ?? _FakeSettingsRepository(),
+        );
+
+    bool bodyHasFocus(WidgetTester tester) =>
+        tester.widget<TextField>(find.byKey(bodyField)).focusNode?.hasFocus ??
+        false;
+
+    testWidgets('从旧版升上来时弹一次，四项信息都在', (tester) async {
+      final repository = _FakeSettingsRepository();
+      await pumpApp(
+        tester,
+        MemoryDiaryStore(),
+        settings: settingsWith('1.0.0', repository: repository),
+        releaseInfo: infoFor('1.1.0'),
+      );
+
+      expect(find.text('本版更新'), findsOneWidget);
+      // 当前版本 + 发布时间
+      expect(find.text('日迹 1.1.0'), findsOneWidget);
+      expect(find.text('2026-10-03 发布'), findsOneWidget);
+      // 新功能与 bug 修复
+      expect(find.text('新功能'), findsOneWidget);
+      expect(find.text('修复'), findsOneWidget);
+      expect(find.textContaining('命令面板'), findsOneWidget);
+      expect(find.textContaining('正文被清空'), findsOneWidget);
+
+      await tester.tap(find.text('知道了'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('本版更新'), findsNothing);
+      expect(repository.saved?.lastSeenVersion, '1.1.0',
+          reason: '关掉之后必须把版本记下来，否则每次启动都会再弹一遍');
+    });
+
+    testWidgets('弹窗里不出现 Markdown 标记，也不出现内部小节', (tester) async {
+      await pumpApp(
+        tester,
+        MemoryDiaryStore(),
+        settings: settingsWith('1.0.0'),
+        releaseInfo: infoFor('1.1.0'),
+      );
+
+      // `Ctrl+K` 的反引号和 **加粗** 的星号都该在解析时就去掉
+      expect(find.text('命令面板：按 Ctrl+K 唤起'), findsOneWidget);
+      expect(find.text('行尾显示快捷键'), findsOneWidget);
+      expect(find.textContaining('`'), findsNothing);
+      expect(find.textContaining('**'), findsNothing);
+      // 「内部」那节一句都不该出现
+      expect(find.textContaining('不该进弹窗'), findsNothing);
+    });
+
+    testWidgets('同一个版本第二次启动不再弹', (tester) async {
+      await pumpApp(
+        tester,
+        MemoryDiaryStore(),
+        settings: settingsWith('1.1.0'),
+        releaseInfo: infoFor('1.1.0'),
+      );
+
+      expect(find.text('本版更新'), findsNothing);
+    });
+
+    testWidgets('第一次装不弹，但要把版本记下来', (tester) async {
+      final repository = _FakeSettingsRepository();
+      await pumpApp(
+        tester,
+        MemoryDiaryStore(),
+        settings: settingsWith(null, repository: repository),
+        releaseInfo: infoFor('1.1.0'),
+      );
+
+      expect(find.text('本版更新'), findsNothing,
+          reason: '刚装上的人不需要看"这一版更新了什么"');
+
+      // 这条是很多人会漏掉的：不记的话，下次升级时程序还认为这是首次安装，
+      // 弹窗就永远不会出现了。
+      expect(repository.saved?.lastSeenVersion, '1.1.0');
+    });
+
+    testWidgets('回退到旧版不弹', (tester) async {
+      await pumpApp(
+        tester,
+        MemoryDiaryStore(),
+        settings: settingsWith('2.0.0'),
+        releaseInfo: infoFor('1.1.0'),
+      );
+
+      expect(find.text('本版更新'), findsNothing);
+    });
+
+    testWidgets('这一版没有写给用户看的内容时，绝不弹空框', (tester) async {
+      // 1.0.0 那节只有「写作」，两节都没有
+      await pumpApp(
+        tester,
+        MemoryDiaryStore(),
+        settings: settingsWith('0.9.0'),
+        releaseInfo: infoFor('1.0.0'),
+      );
+
+      expect(find.text('本版更新'), findsNothing);
+    });
+
+    testWidgets('读不到版本信息时，这个功能整个不出现（也不该崩）', (tester) async {
+      // releaseInfo 不传＝null
+      await pumpApp(
+        tester,
+        MemoryDiaryStore(),
+        settings: settingsWith('1.0.0'),
+      );
+
+      expect(find.text('本版更新'), findsNothing);
+      expect(find.byKey(bodyField), findsOneWidget);
+    });
+
+    testWidgets('关掉弹窗之后焦点回到正文，接着就能写', (tester) async {
+      await pumpApp(
+        tester,
+        MemoryDiaryStore(),
+        settings: settingsWith('1.0.0'),
+        releaseInfo: infoFor('1.1.0'),
+      );
+
+      await tester.tap(find.text('知道了'));
+      await tester.pumpAndSettle();
+
+      // 弹窗在启动时抢走了焦点，关掉之后必须还回来，
+      // 否则用户打的第一句话会掉进空气里（「打开即写」那条）。
+      expect(bodyHasFocus(tester), isTrue);
+    });
+
+    testWidgets('命令面板里的「本版更新」随时能再打开一次', (tester) async {
+      // 弹窗只在升级后弹一次，所以必须留一个找得到的入口——
+      // 做得出来却找不到等于没做。
+      await pumpApp(
+        tester,
+        MemoryDiaryStore(),
+        settings: settingsWith('1.1.0'),
+        releaseInfo: infoFor('1.1.0'),
+      );
+
+      expect(find.text('本版更新'), findsNothing, reason: '同版本，启动时不弹');
+
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+      await tester.sendKeyEvent(LogicalKeyboardKey.keyK);
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+      await tester.pumpAndSettle();
+
+      await tester.enterText(
+        find.byKey(const Key('command-palette-query')),
+        '更新',
+      );
+      await tester.pumpAndSettle();
+      await tester.testTextInput.receiveAction(TextInputAction.done);
+      await tester.pumpAndSettle();
+
+      expect(find.text('本版更新'), findsOneWidget);
+      expect(find.text('日迹 1.1.0'), findsOneWidget);
+    });
+
+    testWidgets('这一版没内容时，「本版更新」这条命令置灰并写明原因', (tester) async {
+      await pumpApp(
+        tester,
+        MemoryDiaryStore(),
+        settings: settingsWith('1.1.0'),
+        releaseInfo: infoFor('1.0.0'),
+      );
+
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+      await tester.sendKeyEvent(LogicalKeyboardKey.keyK);
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+      await tester.pumpAndSettle();
+
+      await tester.enterText(
+        find.byKey(const Key('command-palette-query')),
+        '本版更新',
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.text('这一版没有写给用户看的更新内容'), findsOneWidget);
     });
   });
 }

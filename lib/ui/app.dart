@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../core/diary_location.dart';
+import '../data/release_info.dart';
 import '../state/diary_controller.dart';
 import '../state/settings_controller.dart';
 import 'home_page.dart';
@@ -12,11 +13,16 @@ class RijiApp extends StatelessWidget {
     required this.controller,
     required this.settings,
     required this.onSwitchDiaryRoot,
+    this.releaseInfo,
   });
 
   final DiaryController controller;
   final SettingsController settings;
   final SwitchDiaryRootCallback onSwitchDiaryRoot;
+
+  /// 版本与更新记录。**可空**：读不到就当这个功能不存在，程序照常启动
+  /// （`loadReleaseInfo` 里解释了为什么它不该挡住"打开即写"）。
+  final ReleaseInfo? releaseInfo;
 
   @override
   Widget build(BuildContext context) {
@@ -33,6 +39,7 @@ class RijiApp extends StatelessWidget {
           controller: controller,
           settings: settings,
           onSwitchDiaryRoot: onSwitchDiaryRoot,
+          releaseInfo: releaseInfo,
         ),
       ),
     );

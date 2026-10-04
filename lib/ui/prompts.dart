@@ -1,17 +1,27 @@
 import 'package:flutter/material.dart';
 
+import '../core/app_version.dart';
 import '../core/day.dart';
+import '../data/release_info.dart';
 import '../state/diary_controller.dart';
+import '../state/settings_controller.dart';
+import 'whats_new_dialog.dart';
 
 /// 启动提示。
 ///
 /// 原则：只在该弹的时候弹。每次都弹的提示等于没有提示——
 /// 用户会学会无脑点掉，真正的那次内容丢失反而被忽略。
-/// 所以草稿提示仅在「草稿与已保存内容确实不同」时出现（判定在控制器里）。
+/// 所以草稿提示仅在「草稿与已保存内容确实不同」时出现（判定在控制器里），
+/// 「本版更新」也只在真的升级上来时出现一次（判定在 core/app_version.dart）。
+///
+/// **顺序是刻意的**：草稿和冲突是**数据安全**提示，先让用户处理；
+/// 「本版更新」是信息性的，晚一点看到没有任何损失。
 Future<void> showStartupPrompts(
   BuildContext context,
-  DiaryController controller,
-) async {
+  DiaryController controller, {
+  required SettingsController settings,
+  ReleaseInfo? releaseInfo,
+}) async {
   if (controller.recoverableDrafts.isNotEmpty) {
     await showDialog<void>(
       context: context,
@@ -25,6 +35,39 @@ Future<void> showStartupPrompts(
       builder: (_) => _ConflictsDialog(controller: controller),
     );
   }
+  if (releaseInfo != null && context.mounted) {
+    await maybeShowWhatsNew(
+      context,
+      settings: settings,
+      releaseInfo: releaseInfo,
+    );
+  }
+}
+
+/// 升级之后第一次启动时，弹一次「本版更新」。
+///
+/// **无论弹没弹，只要版本变了就记下来**（[SettingsController.noteVersionSeen]）。
+/// 漏了这一步的表现是：用户每次启动都被问一遍同一个版本的更新内容。
+Future<void> maybeShowWhatsNew(
+  BuildContext context, {
+  required SettingsController settings,
+  required ReleaseInfo releaseInfo,
+}) async {
+  final current = releaseInfo.version;
+
+  if (shouldAnnounceVersion(
+    current: current,
+    lastSeen: settings.lastSeenVersion,
+  )) {
+    // 这一版没有写给用户看的内容（CHANGELOG 里那两节都是空的）时，
+    // 整件事跳过：**绝不显示一个空弹窗**。
+    final notes = releaseInfo.changeLog.forVersion(current);
+    if (notes != null) {
+      await showWhatsNewDialog(context, notes);
+    }
+  }
+
+  await settings.noteVersionSeen(current);
 }
 
 /// 单独打开冲突清单。左侧栏的冲突徽标点进来用。
