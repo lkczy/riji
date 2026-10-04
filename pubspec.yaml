@@ -2,7 +2,7 @@ name: riji
 description: "日迹 —— 一个把日记存成 Markdown 文件的本地日记程序。"
 publish_to: 'none'
 
-version: 1.1.0
+version: 1.2.0
 
 environment:
   sdk: ^3.13.4
@@ -43,3 +43,14 @@ flutter:
   # 哪些不可验证。
   assets:
     - assets/huangli.tsv
+
+    # 「本版更新」弹窗要用的两份文本。
+    #
+    #   · CHANGELOG.md —— 升级后弹给用户看的内容**直接来自它**，所以没有第二份
+    #     「更新摘要」要维护。哪些内容会进弹窗，由该文件开头的约定决定。
+    #   · pubspec.yaml —— 程序自己不知道自己是哪个版本，而查版本需要
+    #     package_info_plus 这类**插件**（见 docs/开发须知.md §6：带原生实现的包
+    #     会让 Windows 构建要开发者模式）。所以把 pubspec 本身打进来读 version
+    #     字段：版本号只有一个真相来源，不存在"忘了同步常量"这种静默失效。
+    - CHANGELOG.md
+    - pubspec.yaml
