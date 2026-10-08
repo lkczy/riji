@@ -283,7 +283,7 @@ void main() {
 
     test('README 里举的例子与实际行为一致', () {
       // 文档里写了具体输出，就该有测试钉住它，否则文档会悄悄过时。
-      // README「农历、节日与节气」一节引用的就是这些。
+      // docs/详细说明.md 的「农历、节日与节气」一节引用的就是这些。
       expect(
         ChineseCalendar.annotate(DateTime(2026, 10, 1)).lunarLine,
         '八月廿一',

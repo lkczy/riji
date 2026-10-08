@@ -2,18 +2,44 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 
+import 'core/reminder.dart';
 import 'data/release_info.dart';
 import 'data/settings.dart';
 import 'core/diary_location.dart';
 import 'platform/platform.dart' as platform;
 import 'state/diary_controller.dart';
+import 'state/reminder_service.dart';
 import 'state/settings_controller.dart';
 import 'ui/app.dart';
 
-void main() {
+Future<void> main(List<String> args) async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  // 通知点回来时，Windows 会拿 `riji://today` 起**一个新进程**。
+  //
+  // 如果已经有实例在跑，这个新进程拿不到实例锁，而且**不用插件没法把已开的
+  // 窗口调到前台**（这是本项目早已知的限制）。所以它只能留一张纸条走人，
+  // 由正在跑的那个实例自己发现——见 HomePage 的轮询。
+  //
+  // 这一整套放在 `runApp` **之前**：窗口是第一帧之后才显示的，没有 widget 树
+  // 就没有第一帧，所以"点了通知"不会先闪一个空窗口再消失。
+  final activation = activationFromArgs(args);
+  if (activation != null) {
+    final locked = await platform.acquireSingleInstanceLock();
+    if (!locked) {
+      await platform.queueActivation(activation);
+      platform.quitApp();
+      return;
+    }
+    // 没有别的实例在跑：这一次就是"用户点了通知"的正常启动（本来就打开今天），
+    // 把锁放回去，让下面真正启动的实例自己拿。
+    // 这里有一瞬间的竞争窗口，但后果无害：最多是另一个实例显示"已经在运行"。
+    await platform.releaseSingleInstanceLock();
+  }
+
   runApp(const RijiBootstrap());
 }
+
 
 /// 先读设置（日记目录在哪），再建存储和控制器。
 ///
@@ -53,6 +79,10 @@ class _RijiBootstrapState extends State<RijiBootstrap> {
       return;
     }
 
+    // 拿到锁说明这一次是正常启动。顺手清掉可能残留的"外部动作纸条"：
+    // 上一轮没人在跑的时候留下的纸条，不该在这次启动时突然生效。
+    unawaited(platform.takeQueuedActivation());
+
     try {
       const repository = SettingsRepository();
       final stored = await repository.load();
@@ -65,6 +95,13 @@ class _RijiBootstrapState extends State<RijiBootstrap> {
         device: device,
       );
       final controller = DiaryController(store: store, deviceName: device);
+
+      // 每日提醒对一次账：改了时间 / 换了日记目录 / 程序挪了位置 / 任务被手工
+      // 删了，都在这里自己修好。指纹一致时一次子进程都不起，所以不拖慢启动。
+      // **不 await**：提醒是锦上添花，绝不能挡住"打开即写"。
+      unawaited(ReminderService(settings: settings).syncOnStartup());
+
+      // 界面上的开关点不到（合成鼠标进不来，见 docs/开发须知.md §2.4），
 
       // 版本与更新记录：和读日记**并行**，不拖慢启动。
       // 读不到就是 null，界面那边整个功能不出现——它是锦上添花，

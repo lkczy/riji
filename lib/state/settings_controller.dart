@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../core/editor_typography.dart';
+import '../core/reminder.dart';
 import '../data/settings.dart';
 
 /// 程序级偏好的持有者。
@@ -132,6 +133,63 @@ class SettingsController extends ChangeNotifier {
     final normalized = version.trim();
     if (normalized.isEmpty || normalized == _settings.lastSeenVersion) return;
     _settings = _settings.copyWith(lastSeenVersion: normalized);
+    notifyListeners();
+    await repository.save(_settings);
+  }
+
+  // ---------------------------------------------------------------------------
+  // 每日提醒
+  // ---------------------------------------------------------------------------
+
+  bool get reminderEnabled => _settings.reminderEnabled;
+
+  /// 提醒时间。**存坏了就退回默认值**，不会让整个设置读不出来。
+  ReminderTime get reminderTime =>
+      ReminderTime.tryParse(_settings.reminderTime) ?? ReminderTime.defaultTime;
+
+  /// 提醒日（1=周一 … 7=周日），默认每天。
+  List<int> get reminderWeekdays => _settings.reminderWeekdays;
+
+  /// 上一次成功装进系统时的指纹。见 [AppSettings.reminderApplied]。
+  String? get reminderApplied => _settings.reminderApplied;
+
+  /// 上一次程序内提醒是哪一天（`2026-10-08`）。见 [AppSettings.reminderLastShown]。
+  DateTime? get reminderLastShown {
+    final raw = _settings.reminderLastShown;
+    return raw == null ? null : DateTime.tryParse(raw);
+  }
+
+  /// 记下"今天已经在程序里提醒过了"。
+  ///
+  /// 记的是日期字符串：一天最多提醒一次，跟用户几点看到的无关。
+  Future<void> noteReminderShown(DateTime day) async {
+    final key = reminderDayKey(day);
+    if (_settings.reminderLastShown == key) return;
+    _settings = _settings.copyWith(reminderLastShown: key);
+    notifyListeners();
+    await repository.save(_settings);
+  }
+
+  /// 记下开关、时间和指纹。
+  ///
+  /// 三样一起写是因为它们**必须同时改变**：开关动了而指纹没动，启动时就不会
+  /// 重装；时间动了而指纹没动，系统里跑的还是旧时间。
+  Future<void> noteReminder({
+    required bool enabled,
+    required ReminderTime time,
+    required List<int> weekdays,
+    required String? applied,
+    bool clearLastShown = false,
+  }) async {
+    _settings = _settings.copyWith(
+      reminderEnabled: enabled,
+      reminderTime: time.label,
+      reminderWeekdays: normalizeWeekdays(weekdays),
+      reminderApplied: applied,
+      clearReminderApplied: applied == null,
+      // 停用时把"今天提醒过"也清掉：当天重新启用的话，到点该照样提醒
+      clearReminderLastShown: clearLastShown,
+    );
     notifyListeners();
     await repository.save(_settings);
   }

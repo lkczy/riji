@@ -1,6 +1,7 @@
 import 'dart:convert';
 
 import '../core/editor_typography.dart';
+import '../core/reminder.dart';
 import '../platform/platform.dart' as platform;
 
 /// 界面外观偏好。
@@ -43,6 +44,11 @@ class AppSettings {
     this.lastBackupAt,
     this.lastBackupError,
     this.lastSeenVersion,
+    this.reminderEnabled = false,
+    this.reminderTime = '21:00',
+    this.reminderWeekdays = allWeekdays,
+    this.reminderApplied,
+    this.reminderLastShown,
   });
 
   final String diaryRoot;
@@ -72,6 +78,44 @@ class AppSettings {
   /// null 表示**第一次装**：此时不弹（没有"上一版"可比），只把当前版本记下来。
   final String? lastSeenVersion;
 
+  /// 每日提醒开关。**默认关**。
+  ///
+  /// 打开它意味着往用户系统里写东西（计划任务 + 两个注册表项 + 一个脚本），
+  /// 这种事必须用户自己点，程序不能替他决定。
+  final bool reminderEnabled;
+
+  /// 提醒时间，`"21:00"` 这样的人能看懂的写法。
+  ///
+  /// 存字符串而不是存时分两个整数：settings.json 是给人看的，
+  /// 而且时间格式坏了的时候要能一眼看出来是哪儿坏了。解析走
+  /// `ReminderTime.tryParse`，非法就退回默认值（**不会让设置读不出来**）。
+  final String reminderTime;
+
+  /// 上一次**成功**装进系统时的指纹（时间 + 日记目录 + 程序路径）。
+  ///
+  /// 和当前值不一致就重装一遍：这样改了时间、换了日记目录、把程序挪了位置、
+  /// 或者用户手工把计划任务删了，都能在下次启动时自己修好；
+  /// 而一致的时候一次子进程都不用起。
+  ///
+  /// 只在**全部成功**之后才写它——写早了会让失败的那次被误认为"已经装好了"。
+  final String? reminderApplied;
+
+  /// 提醒日：一周里哪几天提醒，值是 `DateTime.weekday`（1=周一 … 7=周日）。
+  ///
+  /// 默认**每天**（七个都在）。`toJson` 里是完整七天时**不写这个字段**：
+  /// 默认值不该占用户的配置文件，也让"手改过"一眼看得出来。
+  ///
+  /// 存成数组而不是位掩码或 `"1,2,3"` 字符串：settings.json 是给人看的，
+  /// 数组在编辑器里能看懂，坏了一眼也看得出坏在哪。
+  final List<int> reminderWeekdays;
+
+  /// 上一次**程序内**提醒是哪一天（`2026-10-08`）。
+  ///
+  /// 为什么需要它：程序内的检查是每几秒跑一次的轮询，"到点了"这个条件会一直
+  /// 成立到当天结束——不记下来的话它会一直弹。记的是**日期**不是时间：
+  /// 一天最多提醒一次，跟用户是几点看到的无关。
+  final String? reminderLastShown;
+
   AppSettings copyWith({
     String? diaryRoot,
     AppThemeMode? themeMode,
@@ -80,6 +124,13 @@ class AppSettings {
     DateTime? lastBackupAt,
     String? lastBackupError,
     String? lastSeenVersion,
+    bool? reminderEnabled,
+    String? reminderTime,
+    List<int>? reminderWeekdays,
+    String? reminderApplied,
+    String? reminderLastShown,
+    bool clearReminderApplied = false,
+    bool clearReminderLastShown = false,
     bool clearBackupError = false,
   }) =>
       AppSettings(
@@ -91,6 +142,15 @@ class AppSettings {
         lastBackupError:
             clearBackupError ? null : (lastBackupError ?? this.lastBackupError),
         lastSeenVersion: lastSeenVersion ?? this.lastSeenVersion,
+        reminderEnabled: reminderEnabled ?? this.reminderEnabled,
+        reminderTime: reminderTime ?? this.reminderTime,
+        reminderWeekdays: normalizeWeekdays(reminderWeekdays ?? this.reminderWeekdays),
+        reminderApplied: clearReminderApplied
+            ? null
+            : (reminderApplied ?? this.reminderApplied),
+        reminderLastShown: clearReminderLastShown
+            ? null
+            : (reminderLastShown ?? this.reminderLastShown),
       );
 
   Map<String, dynamic> toJson() => <String, dynamic>{
@@ -103,6 +163,13 @@ class AppSettings {
           'lastBackupAt': lastBackupAt!.toIso8601String(),
         if (lastBackupError != null) 'lastBackupError': lastBackupError,
         if (lastSeenVersion != null) 'lastSeenVersion': lastSeenVersion,
+        if (reminderEnabled) 'reminderEnabled': true,
+        if (reminderTime != '21:00') 'reminderTime': reminderTime,
+        // 七天都在就是默认值，不写进文件
+        if (normalizeWeekdays(reminderWeekdays).length != allWeekdays.length)
+          'reminderWeekdays': normalizeWeekdays(reminderWeekdays),
+        if (reminderApplied != null) 'reminderApplied': reminderApplied,
+        if (reminderLastShown != null) 'reminderLastShown': reminderLastShown,
       };
 
   static AppSettings fromJson(
@@ -119,6 +186,11 @@ class AppSettings {
     final backupAt = json['lastBackupAt'];
     final backupError = json['lastBackupError'];
     final lastSeen = json['lastSeenVersion'];
+    final reminderOn = json['reminderEnabled'];
+    final reminderAt = json['reminderTime'];
+    final reminderApplied = json['reminderApplied'];
+    final reminderWeekdays = json['reminderWeekdays'];
+    final reminderLastShown = json['reminderLastShown'];
 
     return AppSettings(
       diaryRoot:
@@ -138,6 +210,27 @@ class AppSettings {
       // 读不懂就当第一次装：**少弹一次**永远比弹错好
       lastSeenVersion:
           lastSeen is String && lastSeen.trim().isNotEmpty ? lastSeen : null,
+      // 同样按"读不动就当没有"：开关只在明确是 true 时才开
+      reminderEnabled: reminderOn == true,
+      // 时间坏了退回默认值，**不要**因此丢掉其它设置
+      reminderTime: ReminderTime.tryParse(reminderAt is String ? reminderAt : null)
+              ?.label ??
+          ReminderTime.defaultTime.label,
+      // 读进来一堆垃圾（空数组、越界值、手改坏了）→ 退回"每天"，
+      // **绝不**让提醒变成一个莫名其妙的状态（比如只提醒周日）
+      reminderWeekdays: normalizeWeekdays(
+        reminderWeekdays is List
+            ? reminderWeekdays.whereType<int>()
+            : null,
+      ),
+      reminderApplied: reminderApplied is String &&
+              reminderApplied.trim().isNotEmpty
+          ? reminderApplied
+          : null,
+      reminderLastShown: reminderLastShown is String &&
+              reminderLastShown.trim().isNotEmpty
+          ? reminderLastShown
+          : null,
     );
   }
 }

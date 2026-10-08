@@ -23,7 +23,7 @@ enum _AppearanceAction { system, light, dark, typography }
 /// （改日记位置、看历史），要么不该一点就中（删除）。
 ///
 /// 顺序是刻意的：**日常用的在上，碰数据管理的在中，破坏性的单独隔在下**。
-enum _MoreAction { openFolder, location, export, backup, history, trash, delete }
+enum _MoreAction { openFolder, location, export, backup, reminder, history, trash, delete }
 
 /// 右侧写作区。
 ///
@@ -1019,6 +1019,13 @@ class _EditorPanelState extends State<EditorPanel> {
             value: _MoreAction.backup,
             child: row(Icons.save_outlined, '备份'),
           ),
+        // 每日提醒用计划任务 + Windows 通知，非 Windows 平台整个不出现——
+        // 和备份同一个理由：不给一个点了会失败的入口。
+        if (platform.supportsReminder)
+          PopupMenuItem<_MoreAction>(
+            value: _MoreAction.reminder,
+            child: row(Icons.notifications_active_outlined, '每日提醒'),
+          ),
         const PopupMenuDivider(),
         PopupMenuItem<_MoreAction>(
           value: _MoreAction.history,
@@ -1058,6 +1065,8 @@ class _EditorPanelState extends State<EditorPanel> {
           settings: widget.settings,
           controller: _controller,
         );
+      case _MoreAction.reminder:
+        await openReminderSettingsAction(context, widget.settings);
       case _MoreAction.location:
         widget.onOpenLocationSettings?.call();
       case _MoreAction.export:

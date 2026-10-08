@@ -13,12 +13,15 @@ import 'package:riji/core/editor_typography.dart';
 import 'package:riji/core/huangli.dart';
 import 'package:riji/core/models/diary_entry.dart';
 import 'package:riji/core/release_notes.dart';
+import 'package:riji/core/reminder.dart';
 import 'package:riji/data/diary_store.dart';
 import 'package:riji/data/release_info.dart';
 import 'package:riji/data/settings.dart';
 import 'package:riji/state/diary_controller.dart';
+import 'package:riji/state/reminder_service.dart';
 import 'package:riji/state/settings_controller.dart';
 import 'package:riji/ui/app.dart';
+import 'package:riji/ui/reminder_dialog.dart';
 
 /// 记录被写下来的设置，用于验证偏好真的持久化了。
 class _FakeSettingsRepository extends SettingsRepository {
@@ -26,6 +29,40 @@ class _FakeSettingsRepository extends SettingsRepository {
 
   @override
   Future<void> save(AppSettings settings) async => saved = settings;
+}
+
+/// 提醒的假实现。
+///
+/// 真实现会起 PowerShell 往用户系统里写计划任务和注册表——测试里绝不能碰。
+/// 这个假货只记录"被要求做了什么"，并允许指定失败，好验证失败时界面怎么办。
+class _FakeReminderOps implements ReminderOps {
+  bool failEnable = false;
+
+  final List<ReminderTime> enabled = <ReminderTime>[];
+  List<int>? enabledDays;
+  int disableCalls = 0;
+
+  @override
+  Future<ReminderOutcome> enable(ReminderTime time, List<int> weekdays) async {
+    enabled.add(time);
+    enabledDays = weekdays;
+    if (failEnable) {
+      return const ReminderOutcome(
+        ok: false,
+        message: '建计划任务失败，所以到点不会提醒。可以再试一次。',
+      );
+    }
+    return ReminderOutcome(
+      ok: true,
+      message: '已启用：${reminderScheduleLabel(time, weekdays)}，只在那天还没写的时候提醒。',
+    );
+  }
+
+  @override
+  Future<ReminderOutcome> disable() async {
+    disableCalls++;
+    return const ReminderOutcome(ok: true, message: '已关闭，系统里没留东西。');
+  }
 }
 
 /// 界面测试。全部用内存存储和假设置仓库，绝不碰真实文件系统和用户配置。
@@ -43,6 +80,11 @@ void main() {
   const bodyField = Key('diary-body-field');
 
   const baseSettings = AppSettings(diaryRoot: 'memory');
+
+  /// 正文输入框有没有焦点。多个测试组都要用（焦点归还那条），所以放在这里。
+  bool bodyHasFocus(WidgetTester tester) =>
+      tester.widget<TextField>(find.byKey(bodyField)).focusNode?.hasFocus ??
+      false;
 
   Future<DiaryController> pumpApp(
     WidgetTester tester,
@@ -1521,9 +1563,6 @@ void main() {
     bool searchHasFocus(WidgetTester tester) =>
         tester.widget<TextField>(searchField()).focusNode?.hasFocus ?? false;
 
-    bool bodyHasFocus(WidgetTester tester) =>
-        tester.widget<TextField>(find.byKey(bodyField)).focusNode?.hasFocus ??
-        false;
 
     /// 面板输入框用的是 `autofocus`，所以 `TextField.focusNode` 是 null。
     /// 要判断它有没有焦点，得问真正持有焦点的那个 `EditableText`。
@@ -1778,9 +1817,6 @@ void main() {
           repository: repository ?? _FakeSettingsRepository(),
         );
 
-    bool bodyHasFocus(WidgetTester tester) =>
-        tester.widget<TextField>(find.byKey(bodyField)).focusNode?.hasFocus ??
-        false;
 
     testWidgets('从旧版升上来时弹一次，四项信息都在', (tester) async {
       final repository = _FakeSettingsRepository();
@@ -1956,4 +1992,699 @@ void main() {
       expect(find.text('这一版没有写给用户看的更新内容'), findsOneWidget);
     });
   });
+
+  group('写作日历', () {
+    // 年视图的年份：用"今年"而不是写死 2026，否则这个测试到了明年就会红。
+    final year = DateTime.now().year;
+    DateTime day(int month, int dayOfMonth) => DateTime(year, month, dayOfMonth);
+
+    // 月视图用的是"当前所在的那一天"所在的月份，所以可以写死日期，与今天无关。
+    final march = DateTime(2026, 3, 14);
+
+    Finder yearCell(DateTime date) =>
+        find.byKey(ValueKey<String>('calendar-cell-${formatIsoDate(date)}'));
+
+    Finder monthCell(DateTime date) =>
+        find.byKey(ValueKey<String>('calendar-day-${formatIsoDate(date)}'));
+
+    /// 只在对话框里找。
+    ///
+    /// 需要它是因为主界面上有一堆长得像的东西：编辑区标题里写着
+    /// 「2026 年 1 月 15 日 星期四」（含「2026 年 1 月」），侧栏那个按钮也可能
+    /// 正好叫「今天」（今天还没写时标签就是「今天」）。
+    Finder inDialog(Finder matching) =>
+        find.descendant(of: find.byType(AlertDialog), matching: matching);
+
+    /// 某一格的实际颜色。用它验证"深浅真的按字数分"，而不是断言像素值。
+    Color yearCellColor(WidgetTester tester, DateTime date) {
+      final container = tester.widget<Container>(yearCell(date));
+      return (container.decoration! as BoxDecoration).color!;
+    }
+
+    MemoryDiaryStore storeWith(List<DiaryEntry> entries) {
+      final store = MemoryDiaryStore();
+      for (final entry in entries) {
+        store.seed(entry);
+      }
+      return store;
+    }
+
+    DiaryEntry written(DateTime date, String body, {String? mood}) =>
+        DiaryEntry.create(date: date, device: 'test', body: body, mood: mood);
+
+    /// 侧栏那个日历图标开在月视图。
+    ///
+    /// ⚠️ 这里是**按 tooltip 找按钮**的，所以改 `EntryListPanel` 里那句 tooltip
+    /// 必须同步改这里，否则这一组测试全红（改代码位置见 docs/详细说明.md 的「写作日历」一节）。
+    Future<void> openMonthView(WidgetTester tester) async {
+      await tester.tap(find.byTooltip('月视图/年视图'));
+      await tester.pumpAndSettle();
+    }
+
+    /// 打开年视图。
+    ///
+    /// 界面上**没有专门的按钮**了（右下角那个和侧栏图标重复，已删），
+    /// 所以走"侧栏日历图标 → 切到年"这条真实路径；命令面板那条另有专门一条测试。
+    Future<void> openYearView(WidgetTester tester) async {
+      await openMonthView(tester);
+      await tester.tap(find.text('年'));
+      await tester.pumpAndSettle();
+    }
+
+    // -------------------------------------------------------------------------
+    // 年视图
+    // -------------------------------------------------------------------------
+
+    testWidgets('状态栏按钮打开年视图：汇总、图例、星期列都在', (tester) async {
+      await pumpApp(
+        tester,
+        storeWith(<DiaryEntry>[
+          written(day(3, 14), 'a' * 382, mood: '平静'),
+          written(day(3, 15), 'b' * 50),
+          written(day(5, 1), 'c'),
+        ]),
+      );
+
+      await openYearView(tester);
+
+      expect(find.text('写作日历'), findsOneWidget);
+      expect(find.textContaining('写了 3 天'), findsOneWidget);
+      expect(find.textContaining('共 433 字'), findsOneWidget);
+      expect(find.textContaining('最长连续 2 天'), findsOneWidget);
+      // 档位写在图例上，别让用户猜"多少字算深色"
+      expect(find.textContaining('按当天字数分档'), findsOneWidget);
+      // 周一到周日的标签（单字，不会和别处的长文本撞）
+      expect(find.text('一'), findsOneWidget);
+      expect(find.text('日'), findsOneWidget);
+    });
+
+    testWidgets('深和浅真的按字数分：格子的颜色随档位变', (tester) async {
+      await pumpApp(
+        tester,
+        storeWith(<DiaryEntry>[
+          written(day(3, 14), 'a' * 800), // 最深
+          written(day(3, 15), 'b' * 150), // 中间
+        ]),
+      );
+      await openYearView(tester);
+
+      final heavy = yearCellColor(tester, day(3, 14));
+      final mid = yearCellColor(tester, day(3, 15));
+      final none = yearCellColor(tester, day(3, 16)); // 没写过
+
+      expect(heavy, isNot(mid));
+      expect(mid, isNot(none));
+      expect(heavy, isNot(none));
+    });
+
+    testWidgets('鼠标停在年视图的格子上，底下说出那一天', (tester) async {
+      await pumpApp(
+        tester,
+        storeWith(<DiaryEntry>[
+          written(day(3, 14), '今天把数据格式定下来了。', mood: '平静'),
+        ]),
+      );
+      await openYearView(tester);
+
+      expect(find.textContaining('鼠标停在格子上'), findsOneWidget);
+
+      final gesture = await tester.createGesture(kind: PointerDeviceKind.mouse);
+      await gesture.addPointer(location: Offset.zero);
+      addTearDown(gesture.removePointer);
+      await gesture.moveTo(tester.getCenter(yearCell(day(3, 14))));
+      await tester.pump();
+
+      // 用「N 字 · 心情」这一整段来断言：单独一个「平静」会在心情预设里撞车。
+      expect(find.textContaining('12 字 · 平静'), findsOneWidget);
+      // 日期后面带「·」才是详情行；左侧列表里那一天是「2026-03-14 周六」。
+      expect(
+        find.textContaining('${formatIsoDate(day(3, 14))} · '),
+        findsOneWidget,
+      );
+    });
+
+    testWidgets('年视图点一下格子就跳到那一天，对话框关掉', (tester) async {
+      final controller = await pumpApp(
+        tester,
+        storeWith(<DiaryEntry>[written(day(3, 14), '目标那天')]),
+      );
+      await openYearView(tester);
+
+      await tester.tap(yearCell(day(3, 14)));
+      await tester.pumpAndSettle();
+
+      expect(find.text('写作日历'), findsNothing);
+      expect(controller.selectedDate, day(3, 14));
+    });
+
+    testWidgets('这一年一天都没写时明说，而不是给一片空格子', (tester) async {
+      await pumpApp(tester, MemoryDiaryStore());
+      await openYearView(tester);
+
+      expect(find.textContaining('还没有写过日记'), findsOneWidget);
+      // 格子本身还是照画的——空年份也要看得出这是热力图
+      expect(yearCell(day(3, 14)), findsOneWidget);
+    });
+
+    testWidgets('命令面板里搜「热力图」也能打开（落在年视图）', (tester) async {
+      await pumpApp(
+        tester,
+        storeWith(<DiaryEntry>[written(day(3, 14), 'x')]),
+      );
+
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+      await tester.sendKeyEvent(LogicalKeyboardKey.keyK);
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+      await tester.pumpAndSettle();
+
+      await tester.enterText(
+        find.byKey(const Key('command-palette-query')),
+        '热力图',
+      );
+      await tester.pumpAndSettle();
+      await tester.testTextInput.receiveAction(TextInputAction.done);
+      await tester.pumpAndSettle();
+
+      expect(find.text('写作日历'), findsOneWidget);
+      expect(find.textContaining('最长连续'), findsOneWidget,
+          reason: '年视图才有最长连续');
+    });
+
+    testWidgets('窄窗口下年视图不撑坏布局（格子横向滚动）', (tester) async {
+      // 53 周 × 13px 约 690 宽，窄窗口必须还能用——溢出会让测试直接失败
+      await pumpApp(
+        tester,
+        storeWith(<DiaryEntry>[written(day(3, 14), 'x')]),
+        size: const Size(700, 620),
+      );
+      await openYearView(tester);
+
+      expect(find.text('写作日历'), findsOneWidget);
+      expect(yearCell(day(3, 14)), findsOneWidget);
+    });
+
+    // -------------------------------------------------------------------------
+    // 月视图
+    // -------------------------------------------------------------------------
+
+    testWidgets('侧栏日历图标打开月视图：星期表头、日号、当月汇总都在', (tester) async {
+      await pumpApp(
+        tester,
+        storeWith(<DiaryEntry>[
+          written(march, '三月的这一天'),
+          written(DateTime(2026, 3, 20), '三月二十号'),
+          // 上个月的要被算在外，否则"只看这个月"就是假的
+          written(DateTime(2026, 2, 28), '二月的'),
+        ]),
+        date: march,
+      );
+
+      await openMonthView(tester);
+
+      expect(find.text('写作日历'), findsOneWidget);
+      expect(monthCell(march), findsOneWidget);
+      expect(monthCell(DateTime(2026, 3, 20)), findsOneWidget);
+      expect(find.textContaining('2026 年 3 月 · 写了 2 天'), findsOneWidget);
+      expect(find.textContaining('共 11 字'), findsOneWidget);
+      // 上个月那一天不该出现在这个月的格子里
+      expect(monthCell(DateTime(2026, 2, 28)), findsNothing);
+    });
+
+    testWidgets('没悬停时右侧已经显示当前打开的那一天（右边不留空）', (tester) async {
+      await pumpApp(
+        tester,
+        storeWith(<DiaryEntry>[
+          written(march, '今天把数据格式定下来了。', mood: '平静'),
+        ]),
+        date: march,
+      );
+      await openMonthView(tester);
+
+      // 默认状态才是最常见的状态。如果这里只写"请把鼠标移上去"，
+      // 那 300 多像素的右边在默认状态下就是纯浪费。
+      expect(find.textContaining('12 字 · 平静'), findsOneWidget);
+      expect(find.textContaining('鼠标停在格子上'), findsOneWidget);
+    });
+
+    testWidgets('月视图里当日简要放在格子右边，不是在底下', (tester) async {
+      await pumpApp(
+        tester,
+        storeWith(<DiaryEntry>[
+          written(march, '今天把数据格式定下来了。', mood: '平静'),
+        ]),
+        date: march,
+      );
+      await openMonthView(tester);
+
+      final gesture = await tester.createGesture(kind: PointerDeviceKind.mouse);
+      await gesture.addPointer(location: Offset.zero);
+      addTearDown(gesture.removePointer);
+      await gesture.moveTo(tester.getCenter(monthCell(march)));
+      await tester.pump();
+
+      final facts = find.textContaining('12 字 · 平静');
+      expect(facts, findsOneWidget);
+
+      // 右边：简要的左边落在整个格子区右边之外
+      // （2026-03-29 是周日，也就是最后一列）
+      final factsRect = tester.getRect(facts);
+      final lastColumn = tester.getRect(monthCell(DateTime(2026, 3, 29)));
+      expect(factsRect.left, greaterThan(lastColumn.right),
+          reason: '当日简要应该用上右边那片空白');
+
+      // 而且和格子在同一段高度上——如果哪天有人把它挪回底下，这条会红
+      expect(factsRect.top, lessThan(lastColumn.bottom));
+    });
+
+    testWidgets('月视图和年视图的对话框一样大（切换时不跳）', (tester) async {
+      await pumpApp(tester, MemoryDiaryStore(), date: march);
+      await openMonthView(tester);
+      final monthSize = tester.getSize(find.byType(AlertDialog));
+
+      await tester.tap(find.text('年'));
+      await tester.pumpAndSettle();
+      final yearSize = tester.getSize(find.byType(AlertDialog));
+
+      expect(yearSize, monthSize,
+          reason: '两个尺度共用同一块固定高度的格子区，切换时对话框不该跳');
+    });
+
+    // 两个尺度共用同一块「当日详细」，但两边都验一遍：
+    // 万一以后有人给某一侧换了别的实现，这一条会立刻发现。
+    for (final scale in <String>['月', '年']) {
+      testWidgets('$scale视图的当日详细显示整篇正文，按能放下的行数截断', (tester) async {
+        await pumpApp(
+          tester,
+          storeWith(<DiaryEntry>[
+            written(
+              march,
+              '第一段。\n\n第二段也要能看见。\n\n第三段。',
+              mood: '平静',
+            ),
+          ]),
+          date: march,
+        );
+        await openMonthView(tester);
+        if (scale == '年') {
+          await tester.tap(find.text('年'));
+          await tester.pumpAndSettle();
+        }
+
+        final body = tester.widget<Text>(
+          inDialog(find.textContaining('第二段也要能看见')),
+        );
+        // 「整篇」——不是 DiaryEntry.preview 那种只有第一行的东西
+        expect(body.data, contains('第一段'));
+        expect(body.data, contains('第三段'));
+        // 「尽量多显示」——能放几行放几行，而不是固定一行
+        expect(body.maxLines, greaterThan(1));
+        // 放不下的部分交给 Text 自己加省略号
+        expect(body.overflow, TextOverflow.ellipsis);
+      });
+    }
+
+    testWidgets('正文很长时按面板高度截断，窄窗口下也不溢出', (tester) async {
+      // 300 段，肯定放不下——如果"能放几行"算错了，布局会直接溢出，
+      // 而溢出在测试里就是一个异常，这条就会红。
+      final longBody = List<String>.filled(300, '很长很长的一段正文内容').join('\n');
+      await pumpApp(
+        tester,
+        storeWith(<DiaryEntry>[written(march, longBody)]),
+        date: march,
+        size: const Size(700, 620),
+      );
+      await openMonthView(tester);
+
+      final body = tester.widget<Text>(
+        inDialog(find.textContaining('很长很长的一段正文内容')),
+      );
+      expect(body.maxLines, greaterThan(1));
+      expect(body.overflow, TextOverflow.ellipsis);
+    });
+
+    testWidgets('切换按钮能在月和年之间来回切', (tester) async {
+      await pumpApp(
+        tester,
+        storeWith(<DiaryEntry>[written(day(3, 14), 'x')]),
+        date: day(3, 14),
+      );
+
+      await openMonthView(tester);
+      expect(monthCell(day(3, 14)), findsOneWidget);
+      expect(yearCell(day(3, 14)), findsNothing);
+
+      await tester.tap(find.text('年'));
+      await tester.pumpAndSettle();
+
+      expect(yearCell(day(3, 14)), findsOneWidget);
+      expect(monthCell(day(3, 14)), findsNothing);
+      expect(find.textContaining('最长连续'), findsOneWidget);
+
+      await tester.tap(find.text('月'));
+      await tester.pumpAndSettle();
+
+      expect(monthCell(day(3, 14)), findsOneWidget);
+      expect(yearCell(day(3, 14)), findsNothing);
+    });
+
+    testWidgets('月视图点一下某天就跳过去，对话框关掉', (tester) async {
+      final controller = await pumpApp(
+        tester,
+        MemoryDiaryStore(),
+        date: march,
+      );
+
+      await openMonthView(tester);
+      await tester.tap(monthCell(DateTime(2026, 3, 20)));
+      await tester.pumpAndSettle();
+
+      expect(find.text('写作日历'), findsNothing);
+      expect(controller.selectedDate, DateTime(2026, 3, 20));
+    });
+
+    testWidgets('月视图能翻上个月、下个月（跨年也对）', (tester) async {
+      await pumpApp(tester, MemoryDiaryStore(), date: DateTime(2026, 1, 15));
+      await openMonthView(tester);
+
+      expect(inDialog(find.textContaining('2026 年 1 月')), findsOneWidget);
+
+      await tester.tap(find.byTooltip('上个月'));
+      await tester.pumpAndSettle();
+      // 一月往前是去年十二月，年份要跟着退
+      expect(inDialog(find.textContaining('2025 年 12 月')), findsOneWidget);
+
+      await tester.tap(find.byTooltip('下个月'));
+      await tester.pumpAndSettle();
+      expect(inDialog(find.textContaining('2026 年 1 月')), findsOneWidget);
+    });
+
+    testWidgets('月视图里「今天」按钮跳到今天', (tester) async {
+      final controller = await pumpApp(
+        tester,
+        MemoryDiaryStore(),
+        date: march,
+      );
+
+      await openMonthView(tester);
+      await tester.tap(inDialog(find.text('今天')));
+      await tester.pumpAndSettle();
+
+      expect(controller.selectedDate, dateOnly(DateTime.now()));
+    });
+
+    testWidgets('这一月一天都没写时也明说', (tester) async {
+      await pumpApp(tester, MemoryDiaryStore(), date: march);
+      await openMonthView(tester);
+
+      expect(find.textContaining('还没有写过日记'), findsOneWidget);
+      // 格子照画，否则就不知道这是一个日历
+      expect(monthCell(march), findsOneWidget);
+    });
+
+    // -------------------------------------------------------------------------
+    // 两个尺度共有的行为
+    // -------------------------------------------------------------------------
+
+    testWidgets('关掉之后焦点回到正文，接着就能写', (tester) async {
+      await pumpApp(
+        tester,
+        storeWith(<DiaryEntry>[written(day(3, 14), 'x')]),
+      );
+      await openYearView(tester);
+
+      await tester.tap(find.text('关闭'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('写作日历'), findsNothing);
+      expect(bodyHasFocus(tester), isTrue);
+    });
+  });
+
+  group('每日提醒', () {
+    // 界面测试**绝不能真的去改系统**：真实现会起 PowerShell 写注册表、
+    // 建计划任务。所以这里换一个假的进来，才能验证"成功/失败时界面显示什么"。
+    late _FakeReminderOps ops;
+
+    setUp(() => ops = _FakeReminderOps());
+
+    SettingsController settingsWith({
+      bool enabled = false,
+      String time = '21:00',
+      _FakeSettingsRepository? repository,
+    }) =>
+        SettingsController(
+          initial: AppSettings(
+            diaryRoot: 'memory',
+            reminderEnabled: enabled,
+            reminderTime: time,
+          ),
+          repository: repository ?? _FakeSettingsRepository(),
+        );
+
+    /// 单独架一个最小界面来开这个对话框。
+    ///
+    /// 不走主界面那条路（「⋮」菜单 → `openReminderSettingsAction`）：那条路会
+    /// 构造**真的** ReminderService，测试点到开关上就真的会去改系统。
+    /// 菜单入口单独有一条测试，只验证"能打开"，不碰开关。
+    Future<void> pumpDialog(
+      WidgetTester tester,
+      SettingsController settings,
+    ) async {
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Builder(
+            builder: (context) => Scaffold(
+              body: Center(
+                child: ElevatedButton(
+                  onPressed: () =>
+                      showReminderDialog(context, settings, ops: ops),
+                  child: const Text('打开提醒设置'),
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+      await tester.tap(find.text('打开提醒设置'));
+      await tester.pumpAndSettle();
+    }
+
+    testWidgets('打开时说明白它会往系统里写什么', (tester) async {
+      await pumpDialog(tester, settingsWith());
+
+      expect(find.text('每日提醒'), findsOneWidget);
+      expect(find.textContaining('计划任务'), findsWidgets);
+      expect(find.textContaining('打开后会在系统里留一个计划任务'), findsOneWidget);
+      expect(find.textContaining('注册表'), findsWidgets);
+      // 「写过」是哪个定义必须写出来——本项目有两套定义
+      expect(find.textContaining('「写过」= 那天有正文、心情、天气或标签'),
+          findsOneWidget);
+    });
+
+    testWidgets('打开开关：调用了启用，开关变成开', (tester) async {
+      // 「成功后设置里记下了什么」由 reminder_service_test.dart 验证，
+      // 这里只验界面自己的行为（调了谁、显示什么、开关什么状态）。
+      await pumpDialog(tester, settingsWith());
+
+      await tester.tap(find.byType(Switch));
+      await tester.pumpAndSettle();
+
+      expect(ops.enabled, <ReminderTime>[const ReminderTime(21, 0)]);
+      expect(tester.widget<Switch>(find.byType(Switch)).value, isTrue);
+      expect(find.textContaining('已启用'), findsOneWidget);
+    });
+
+    testWidgets('启用失败时不许把开关拨过去', (tester) async {
+      // 这是最要命的一种错：界面显示"已启用"，而系统里什么都没有——
+      // 到点不提醒，用户却以为已经开了。
+      ops.failEnable = true;
+      await pumpDialog(tester, settingsWith());
+
+      await tester.tap(find.byType(Switch));
+      await tester.pumpAndSettle();
+
+      expect(tester.widget<Switch>(find.byType(Switch)).value, isFalse);
+      expect(find.textContaining('建计划任务失败'), findsOneWidget);
+    });
+
+    testWidgets('已启用时改时间：要按一下「改成 HH:MM」才生效', (tester) async {
+      await pumpDialog(tester, settingsWith(enabled: true));
+
+      // 只是选了个新时间，不该偷偷去改系统
+      await tester.tap(find.byType(DropdownButton<int>).first);
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('22').last);
+      await tester.pumpAndSettle();
+      expect(ops.enabled, isEmpty);
+
+      await tester.tap(find.text('改成 22:00'));
+      await tester.pumpAndSettle();
+      expect(ops.enabled, <ReminderTime>[const ReminderTime(22, 0)]);
+    });
+
+    testWidgets('关掉开关会停用', (tester) async {
+      await pumpDialog(tester, settingsWith(enabled: true));
+
+      await tester.tap(find.byType(Switch));
+      await tester.pumpAndSettle();
+
+      expect(ops.disableCalls, 1);
+      expect(tester.widget<Switch>(find.byType(Switch)).value, isFalse);
+      expect(find.textContaining('已关闭'), findsOneWidget);
+    });
+
+    testWidgets('改提醒日：默认每天，按一下「应用新的提醒日」才生效', (tester) async {
+      await pumpDialog(tester, settingsWith(enabled: true));
+
+      final chips =
+          tester.widgetList<FilterChip>(find.byType(FilterChip)).toList();
+      expect(chips.length, 7);
+      expect(chips.every((chip) => chip.selected), isTrue, reason: '默认每天');
+
+      // 取消周六、周日
+      await tester.tap(find.widgetWithText(FilterChip, '六'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.widgetWithText(FilterChip, '日'));
+      await tester.pumpAndSettle();
+      expect(ops.enabled, isEmpty, reason: '改选择不该立刻去改系统');
+
+      await tester.tap(find.text('应用新的提醒日'));
+      await tester.pumpAndSettle();
+
+      expect(ops.enabledDays, <int>[1, 2, 3, 4, 5]);
+      // 成功消息用日程文案说人话（不是"1,2,3,4,5"）
+      expect(find.textContaining('工作日'), findsOneWidget);
+    });
+
+    testWidgets('不让把最后一天也取消掉（否则这个功能永远不会触发）', (tester) async {
+      await pumpDialog(tester, settingsWith(enabled: true));
+
+      for (final label in <String>['二', '三', '四', '五', '六', '日']) {
+        await tester.tap(find.widgetWithText(FilterChip, label));
+        await tester.pumpAndSettle();
+      }
+      expect(find.text('至少要选一天。'), findsOneWidget);
+
+      // 只剩周一了，再点一次不该有任何变化
+      await tester.tap(find.widgetWithText(FilterChip, '一'));
+      await tester.pumpAndSettle();
+      expect(
+        tester
+            .widget<FilterChip>(find.widgetWithText(FilterChip, '一'))
+            .selected,
+        isTrue,
+      );
+    });
+
+    testWidgets('程序内提醒：点「现在写」会记下今天并把光标交给正文', (tester) async {
+      final settings = settingsWith(enabled: true);
+      var wrote = false;
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Builder(
+            builder: (context) => Scaffold(
+              body: Center(
+                child: ElevatedButton(
+                  onPressed: () => showInAppReminder(
+                    context,
+                    settings: settings,
+                    onWrite: () => wrote = true,
+                  ),
+                  child: const Text('弹提醒'),
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+      await tester.tap(find.text('弹提醒'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('今天还没写日记'), findsOneWidget);
+      expect(find.textContaining('这一天还是空的'), findsOneWidget);
+
+      await tester.tap(find.text('现在写'));
+      await tester.pumpAndSettle();
+
+      expect(wrote, isTrue);
+      // 记的是"今天"：下一次轮询就不该再弹了（判断本身在 reminder_test.dart 里测）
+      expect(
+        reminderDayKey(settings.reminderLastShown!),
+        reminderDayKey(DateTime.now()),
+      );
+    });
+
+    testWidgets('程序内提醒：点「今天算了」也记下今天，但不动光标', (tester) async {
+      final settings = settingsWith(enabled: true);
+      var wrote = false;
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Builder(
+            builder: (context) => Scaffold(
+              body: Center(
+                child: ElevatedButton(
+                  onPressed: () => showInAppReminder(
+                    context,
+                    settings: settings,
+                    onWrite: () => wrote = true,
+                  ),
+                  child: const Text('弹提醒'),
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+      await tester.tap(find.text('弹提醒'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('今天算了'));
+      await tester.pumpAndSettle();
+
+      expect(wrote, isFalse);
+      // 关键：点了"今天算了"也必须记下来，否则轮询每几秒就再弹一次
+      expect(
+        reminderDayKey(settings.reminderLastShown!),
+        reminderDayKey(DateTime.now()),
+      );
+    });
+
+    testWidgets('「⋮」菜单里有入口，点得开', (tester) async {
+      final controller = await pumpApp(tester, MemoryDiaryStore());
+      // 这一条只验证"入口在、点得开"，不去碰开关——
+      // 因为这条路上是**真的** ReminderService（见 pumpDialog 的注释）。
+      expect(controller.selectedDate, isNotNull);
+
+      await tester.tap(find.byTooltip('更多'));
+      await tester.pumpAndSettle();
+      expect(find.text('每日提醒'), findsOneWidget);
+
+      await tester.tap(find.text('每日提醒'));
+      await tester.pumpAndSettle();
+      expect(find.text('每日提醒'), findsOneWidget);
+      expect(find.byType(Switch), findsOneWidget);
+    });
+
+    testWidgets('命令面板里搜「提醒」也能打开', (tester) async {
+      await pumpApp(tester, MemoryDiaryStore());
+
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+      await tester.sendKeyEvent(LogicalKeyboardKey.keyK);
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+      await tester.pumpAndSettle();
+
+      await tester.enterText(
+        find.byKey(const Key('command-palette-query')),
+        '提醒',
+      );
+      await tester.pumpAndSettle();
+      await tester.testTextInput.receiveAction(TextInputAction.done);
+      await tester.pumpAndSettle();
+
+      expect(find.text('每日提醒'), findsOneWidget);
+      expect(find.byType(Switch), findsOneWidget);
+    });
+  });
 }
+

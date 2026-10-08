@@ -252,7 +252,7 @@ class _EntryListPanelState extends State<EntryListPanel> {
                   ),
                   const SizedBox(width: 8),
                   IconButton.filledTonal(
-                    tooltip: '选择日期',
+                    tooltip: '月视图/年视图',
                     onPressed: widget.onPickDate,
                     icon: const Icon(Icons.calendar_month, size: 18),
                   ),

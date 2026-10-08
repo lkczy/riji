@@ -1,5 +1,6 @@
 import '../core/backup.dart';
 import '../core/diary_location.dart';
+import '../core/reminder.dart';
 import '../data/diary_store.dart';
 
 /// web 上的平台实现。
@@ -105,3 +106,29 @@ List<String> listDiaryDriveRoots() => <String>[];
 Future<List<String>> listDiarySubdirectories(String path) async => <String>[];
 
 String? diaryParentDirectory(String path) => null;
+
+// -----------------------------------------------------------------------------
+// 每日提醒：预览模式没有系统集成，整个功能不出现
+// -----------------------------------------------------------------------------
+
+/// web 上既没有计划任务也没有 Windows 通知，**界面必须据此隐藏入口**，
+/// 而不是给一个点了会失败的开关。
+bool get supportsReminder => false;
+
+/// 预览模式没有"程序本体路径"这回事。
+String get appExecutablePath => '';
+
+Future<ReminderOutcome> applyReminder({
+  required ReminderTime time,
+  required List<int> weekdays,
+  required String diaryRoot,
+  required List<int> iconBytes,
+}) async =>
+    const ReminderOutcome(ok: false, message: '预览模式没有系统集成，无法启用提醒。');
+
+Future<ReminderOutcome> removeReminder() async =>
+    const ReminderOutcome(ok: true, message: '已关闭。');
+
+Future<void> queueActivation(String url) async {}
+
+Future<String?> takeQueuedActivation() async => null;

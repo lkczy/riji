@@ -77,7 +77,7 @@ class _WhatsNewDialog extends StatelessWidget {
         ),
       ),
       actions: <Widget>[
-        // 不带「…」：它不打开下一层（README 里那条约定）
+        // 不带「…」：它不打开下一层（详细说明里那条约定）
         FilledButton(
           onPressed: () => Navigator.of(context).pop(),
           child: const Text('知道了'),

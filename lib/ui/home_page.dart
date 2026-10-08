@@ -10,11 +10,13 @@ import '../core/command_palette.dart';
 import '../core/day.dart';
 import '../core/diary_location.dart';
 import '../core/release_notes.dart';
+import '../core/reminder.dart';
 import '../data/release_info.dart';
 import '../data/settings.dart';
 import '../platform/platform.dart' as platform;
 import '../state/diary_controller.dart';
 import '../state/settings_controller.dart';
+import 'calendar_dialog.dart';
 import 'command_palette.dart';
 import 'diary_actions.dart';
 import 'diary_location_dialog.dart';
@@ -22,6 +24,7 @@ import 'editor_panel.dart';
 import 'entry_list_panel.dart';
 import 'markdown_formatting.dart';
 import 'prompts.dart';
+import 'reminder_dialog.dart';
 import 'theme.dart';
 import 'whats_new_dialog.dart';
 
@@ -67,11 +70,97 @@ class _DiaryHomePageState extends State<DiaryHomePage>
 
   DiaryController get _controller => widget.controller;
 
+  /// 正在处理一个"外部动作"（通知点回来）。防止轮询叠第二次。
+  bool _handlingActivation = false;
+
+  /// 界面是什么时候起来的。程序内提醒用它判断"程序是否跨过了提醒时间"。
+  late final DateTime _appStartedAt;
+
+  /// 正在弹程序内提醒。防止轮询叠出第二个对话框。
+  bool _reminding = false;
+
+  /// 到点了就在程序里提醒一次。
+  ///
+  /// 和计划任务的分工：**程序开着就由程序自己说**，那边的脚本看到 riji 进程
+  /// 在跑就不发系统通知（见 `lib/core/reminder.dart` 的 shouldRemindInApp）。
+  /// 两条路径都响的话，用户会被同一件事提醒两次。
+  ///
+  /// 判断本身在纯函数里（可测），这里只负责"该弹就弹"。
+  Future<void> _maybeShowReminder() async {
+    if (_reminding || !mounted) return;
+    final settings = widget.settings;
+    final now = DateTime.now();
+
+    if (!shouldRemindInApp(
+      now: now,
+      appStartedAt: _appStartedAt,
+      time: settings.reminderTime,
+      // 今天不是选中的提醒日 → 不弹（计划任务那天也不会触发，两条路径要一致）
+      weekdays: settings.reminderWeekdays,
+      enabled: settings.reminderEnabled,
+      // 「写过」用"有内容"那一套（和日历一致），不是"文件存在"。
+      // 不能只问 isCurrentEntryEmpty：用户可能正在翻别的日子。
+      todayWritten: dayHasContent(
+        day: now,
+        selectedDate: _controller.selectedDate,
+        currentEntryEmpty: _controller.isCurrentEntryEmpty,
+        entries: _controller.entries,
+      ),
+      lastShownDay: settings.reminderLastShown,
+    )) {
+      return;
+    }
+
+    _reminding = true;
+    try {
+      await showInAppReminder(
+        context,
+        settings: settings,
+        onWrite: () {
+          if (!mounted) return;
+          unawaited(_controller.openDate(DateTime.now()));
+          _bodyFocus.requestFocus();
+        },
+      );
+    } finally {
+      _reminding = false;
+    }
+  }
+
+  /// 看有没有"外部要我做的事"，有就做掉。
+  /// 现在是唯一一种：**用户点了每日提醒的通知**。那时候 Windows 起了第二个
+  /// 实例、它拿不到锁、又没法把我们的窗口调到前台，于是留了张纸条（见
+  /// `main.dart` 和 platform 层的 `queueActivation`）。这里就是读纸条的地方。
+  ///
+  /// 纸条读走就删，所以只会生效一次；读不懂的内容直接忽略——
+  /// **外部写进来的东西不能让它左右程序**。
+  Future<void> _pollActivation() async {
+    if (_handlingActivation) return;
+    final url = await platform.takeQueuedActivation();
+    if (url == null || !mounted) return;
+    if (activationFromArgs(<String>[url]) == null) return;
+
+    _handlingActivation = true;
+    try {
+      // 点提醒 = 回到今天。不用弹窗解释"你刚才点了什么"：
+      // 用户点它是为了写日记，那就让他能直接写。
+      await _controller.openDate(DateTime.now());
+      if (!mounted) return;
+      _bodyFocus.requestFocus();
+    } finally {
+      _handlingActivation = false;
+    }
+  }
+
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _controller.addListener(_onControllerChanged);
+
+    // "程序是什么时候起来的"——程序内提醒只在**程序确实跨过了提醒时间**时才弹。
+    // 22 点才打开程序的人不该一开就被告知"今天还没写"：他打开就是为了写。
+    _appStartedAt = DateTime.now();
 
     // 盯住磁盘：同步工具随时可能把另一台设备的版本放进来。
     //
@@ -79,7 +168,14 @@ class _DiaryHomePageState extends State<DiaryHomePage>
     // widget 测试结束时会检查有没有还挂着的定时器。
     _externalWatchTimer = Timer.periodic(
       DiaryController.externalWatchInterval,
-      (_) => unawaited(_controller.checkExternalChange()),
+      (_) {
+        unawaited(_controller.checkExternalChange());
+        // 同一个轮询顺手看有没有"外部要我做的事"（通知点回来了），
+        // 以及"到点了该提醒了"。不另起定时器：多一个定时器就多一处
+        // 会忘记销毁的东西。
+        unawaited(_pollActivation());
+        unawaited(_maybeShowReminder());
+      },
     );
 
     // 控制器完全可能在界面创建**之前**就已经加载完了（内存存储、
@@ -266,18 +362,14 @@ class _DiaryHomePageState extends State<DiaryHomePage>
     setState(() {});
   }
 
-  Future<void> _pickDate() async {
-    final picked = await showDatePicker(
-      context: context,
-      initialDate: _controller.selectedDate,
-      firstDate: DateTime(1970),
-      lastDate: DateTime.now().add(const Duration(days: 365)),
-      helpText: '选择日期',
-      cancelText: '取消',
-      confirmText: '确定',
-    );
-    if (picked != null) await _controller.openDate(picked);
-  }
+  /// 打开写作日历，落在**月视图**（这个入口的本意是"选日期"）。
+  ///
+  /// 原来这里用的是 Flutter 自带的 `showDatePicker`。换掉它的三个理由：
+  /// ① 它不认识"这天写过没有"，而选日期时最想知道的就是这个；
+  /// ② 程序没配 `localizationsDelegates`，所以它内部的月份名和星期表头是**英文**；
+  /// ③ 日历和热力图读的是同一批数据、动作也一样，分成两个入口只会让人猜该点哪个。
+  Future<void> _pickDate() =>
+      showCalendarDialog(context, _controller, initialScale: CalendarScale.month);
 
   Future<void> _openLocationDialog() async {
     final message = await showDialog<String>(
@@ -291,6 +383,23 @@ class _DiaryHomePageState extends State<DiaryHomePage>
     ScaffoldMessenger.of(context)
         .showSnackBar(SnackBar(content: Text(message)));
   }
+
+  // ---------------------------------------------------------------------------
+  // 写作热力图
+  // ---------------------------------------------------------------------------
+
+  /// 打开写作热力图对话框。
+  ///
+  /// 和命令面板一样挂在 `HomePage`：侧栏的按钮和写作区的按钮都要能开它。
+  /// 关掉之后焦点由框架还给打开之前那个控件（正文），所以这里不用手动处理——
+  /// 有一条界面测试守着这一点。
+  /// 打开写作日历，落在**年视图**（热力图）。
+  ///
+  /// 界面上**不再有专门的按钮**：右下角那个和侧栏的日历图标功能重复，已经删掉。
+  /// 现在只有命令面板里这一条（搜「热力图」）会直接落到年视图，其余入口都先落在
+  /// 月视图，靠框里的 `月 | 年` 切换。
+  Future<void> _openHeatmap() =>
+      showCalendarDialog(context, _controller, initialScale: CalendarScale.year);
 
   // ---------------------------------------------------------------------------
   // 命令面板
@@ -465,7 +574,15 @@ class _DiaryHomePageState extends State<DiaryHomePage>
         command: const PaletteCommand(
           id: 'nav.pickDate',
           title: '选择日期',
-          keywords: <String>['日期', '日历', '跳转', '选日期', 'calendar'],
+          subtitle: '写作日历（月视图）；框里能切到年视图看热力图',
+          keywords: <String>[
+            '日期',
+            '日历',
+            '跳转',
+            '选日期',
+            '热力图',
+            'calendar',
+          ],
         ),
       ),
       CommandAction(
@@ -480,6 +597,44 @@ class _DiaryHomePageState extends State<DiaryHomePage>
           disabledReason: '还没有以前写过的日记可以翻',
         ),
       ),
+      CommandAction(
+        icon: Icons.calendar_view_month,
+        run: () async => _openHeatmap(),
+        command: const PaletteCommand(
+          id: 'view.heatmap',
+          title: '写作热力图',
+          subtitle: '写作日历（年视图）；框里能切到月视图选日期',
+          keywords: <String>[
+            '热力图',
+            '格子',
+            '统计',
+            '这一年',
+            '字数',
+            '日历',
+            'heatmap',
+          ],
+        ),
+      ),
+      if (platform.supportsReminder)
+        CommandAction(
+          icon: Icons.notifications_active_outlined,
+          run: () async =>
+              openReminderSettingsAction(context, widget.settings),
+          command: const PaletteCommand(
+            id: 'settings.reminder',
+            title: '每日提醒',
+            subtitle: '到点如果今天还没写，让 Windows 弹一条通知',
+            keywords: <String>[
+              '提醒',
+              '通知',
+              '每日',
+              '每天',
+              '定时',
+              'notification',
+              'reminder',
+            ],
+          ),
+        ),
       CommandAction(
         icon: Icons.search,
         // 这条命令的**结果就是**把光标放到侧栏搜索框里，所以焦点目标不是正文。

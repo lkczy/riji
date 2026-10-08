@@ -21,6 +21,7 @@ import 'backup_dialog.dart';
 import 'filter_dialog.dart';
 import 'history_dialog.dart';
 import 'markdown_formatting.dart';
+import 'reminder_dialog.dart';
 import 'trash_dialog.dart';
 import 'typography_dialog.dart';
 
@@ -68,6 +69,17 @@ Future<void> openBackupAction(
   required DiaryController controller,
 }) {
   return showBackupDialog(context, settings: settings, controller: controller);
+}
+
+/// 每日提醒设置。
+///
+/// 和别的动作一样只放一份实现：「⋮」菜单和命令面板都走这里。
+/// 入口只在支持的平台出现（见 [platform.supportsReminder]）。
+Future<void> openReminderSettingsAction(
+  BuildContext context,
+  SettingsController settings,
+) {
+  return showReminderDialog(context, settings);
 }
 
 /// 历史版本。对话框关掉时可能带回来一句话，要转达给用户。

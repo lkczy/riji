@@ -2,7 +2,7 @@ name: riji
 description: "日迹 —— 一个把日记存成 Markdown 文件的本地日记程序。"
 publish_to: 'none'
 
-version: 1.2.0
+version: 1.3.0
 
 environment:
   sdk: ^3.13.4
@@ -54,3 +54,11 @@ flutter:
     #     字段：版本号只有一个真相来源，不存在"忘了同步常量"这种静默失效。
     - CHANGELOG.md
     - pubspec.yaml
+
+    # 程序图标（每日提醒用）。
+    #
+    # 为什么要把图标文件也打进包：Windows 通知的"归属图标"写在注册表的
+    # `IconUri` 里，它必须指向磁盘上一个 **.ico/.png 文件**——不能指向 exe。
+    # 而程序自己的图标是编进 exe 资源里的，磁盘上没有这个文件，
+    # 所以启用提醒时要从这里读出来、写一份到设置目录。
+    - windows/runner/resources/app_icon.ico
