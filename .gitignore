@@ -56,3 +56,6 @@ app.*.map.json
 
 # 启动器的快捷方式：由 tool/build_release.ps1 生成，且和具体机器相关
 *.lnk
+
+# 鍙戝竷鍖咃紙zip + 缁勮鐩綍锛夛細鏋勫缓浜х墿锛岀敱 tool 娴佺▼鐜板満鐢熸垚
+/dist/
