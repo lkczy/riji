@@ -5,11 +5,15 @@ import 'package:riji/core/day.dart';
 import 'package:riji/core/diary_filter.dart';
 import 'package:riji/core/history.dart';
 import 'package:riji/core/models/diary_entry.dart';
+import 'package:riji/core/vault_crypto.dart';
+import 'package:riji/core/vault_format.dart';
 import 'package:riji/core/writing_prompts.dart';
 import 'package:riji/data/diary_store.dart';
 import 'package:riji/data/fs_diary_store.dart';
 import 'package:riji/state/diary_controller.dart';
 import 'package:path/path.dart' as p;
+
+import 'vault_test_helpers.dart';
 
 void main() {
   group('自动保存', () {
@@ -1166,4 +1170,344 @@ void main() {
       root.deleteSync(recursive: true);
     });
   });
+  // ---------------------------------------------------------------------------
+  // 加密护栏
+  // ---------------------------------------------------------------------------
+
+  group('程序锁：锁定要清掉内存里的内容', () {
+    test('lockApp 之后：条目没了、正文空了、密钥也没了', () async {
+      final store = MemoryDiaryStore();
+      await store.save(DiaryEntry.create(
+        date: DateTime(2026, 10, 8),
+        device: 'test',
+        body: '记得买牛奶',
+      ));
+      final controller = DiaryController(store: store, deviceName: 'test');
+      await controller.load();
+      // load() 之后没有打开任何一天（这一点以前踩过坑），所以先明确打开
+      await controller.openDate(DateTime(2026, 10, 8));
+
+      expect(controller.entries, isNotEmpty, reason: '先确认本来是有内容的');
+      expect(controller.body, contains('牛奶'));
+
+      await controller.lockApp();
+
+      // 这一条是**反向可验证**的核心：把清空那几行删掉，这个测试必须变红。
+      // 只丢密钥是不够的——明文的日子本来就以明文读进了内存，
+      // 不清掉的话"锁上"只是屏幕上看不见而已。
+      expect(controller.entries, isEmpty, reason: '内存里的日记必须一起消失');
+      expect(controller.body, isEmpty);
+      expect(controller.currentDayIsLocked, isFalse, reason: '不再停在任何一天上');
+      expect(controller.isCurrentEntryEmpty, isTrue);
+    });
+
+    test('没配置保险库时 lockApp 也不炸（预览模式没有加密）', () async {
+      final store = MemoryDiaryStore();
+      final controller = DiaryController(store: store, deviceName: 'test');
+      await controller.load();
+      await controller.lockApp();
+      expect(controller.entries, isEmpty);
+    });
+  });
+
+  group('加密：保存护栏', () {
+    /// 一条"按段锁着"的条目：正文有一行黑条，密文里对应一段。
+    /// 这里只关心**数量**，密文本身是假的。
+    DiaryEntry lockedEntry({int redactions = 1}) => DiaryEntry(
+          id: '01M4A3EMFRK1XZN0GD5GFEMSDR',
+          date: DateTime(2026, 10, 8),
+          created: DateTime(2026, 10, 8, 9),
+          updated: DateTime(2026, 10, 8, 9),
+          device: 'test',
+          body: '第一行\n████████',
+          lock: DayLock(
+            params: const KdfParams(memoryKib: 8 * 1024, iterations: 1, parallelism: 1),
+            redactions: <String, String>{
+              for (var i = 0; i < redactions; i++) 'r${i + 1}': 'v1:QUJD',
+            },
+          ),
+        );
+
+    test('黑条比密文多时**拒绝保存**，并说明原因', () async {
+      final store = MemoryDiaryStore();
+      final controller = DiaryController(store: store, deviceName: 'test');
+      await controller.load();
+      // 直接把一条"对不上"的条目塞进控制器（真实路径是手打方块、或恢复
+      // 了黑条数不匹配的草稿）
+      final entry = lockedEntry();
+      await store.save(entry);
+      await controller.load(preferredDate: DateTime(2026, 10, 8));
+
+      // 正文里手动多加一行黑条（模拟用户手打）
+      controller.updateBody('第一行\n████████\n████████');
+      await controller.saveNow();
+
+      expect(controller.saveState, SaveState.failed);
+      expect(controller.saveError, isNotNull);
+      expect(controller.saveError, contains('黑条'));
+      // 磁盘上仍然是原来那一份，没有被写坏
+      final onDisk = await store.loadByDate(DateTime(2026, 10, 8));
+      expect(onDisk!.body, '第一行\n████████');
+      controller.dispose();
+    });
+
+    test('黑条和密文对得上时正常保存', () async {
+      final store = MemoryDiaryStore();
+      final controller = DiaryController(store: store, deviceName: 'test');
+      await store.save(lockedEntry());
+      await controller.load(preferredDate: DateTime(2026, 10, 8));
+
+      controller.updateBody('改过的第一行\n████████');
+      await controller.saveNow();
+
+      expect(controller.saveState, SaveState.saved);
+      expect((await store.loadByDate(DateTime(2026, 10, 8)))!.body, '改过的第一行\n████████');
+      controller.dispose();
+    });
+  });
+  // ---------------------------------------------------------------------------
+  // 加密：四个缺口的护栏（2026-10-08 补）
+  // ---------------------------------------------------------------------------
+
+  group('加密：关闭加密与解锁联动', () {
+    final root = r'D:\someone\MyData';
+    final day = DateTime(2026, 10, 8);
+    final second = DateTime(2026, 10, 9);
+    const passphrase = '口令口令';
+
+    test('关闭加密：全部解开之后才删保险库文件', () async {
+      final files = FakeVaultFiles();
+      final vault = makeVault(files, root: root);
+      await vault.load();
+      await vault.setUp(passphrase);
+
+      final store = MemoryDiaryStore();
+      await store.save(await vault.lockWholeDay(entryFor(day, '整天锁起来的秘密')));
+      await store.save(await vault.lockLine(entryFor(second, '第一行\n按段锁的秘密'), 1));
+
+      final controller = DiaryController(
+        store: store,
+        deviceName: 'test',
+        vault: vault,
+      );
+      await controller.load();
+      expect(controller.lockedEntriesCount, 2);
+
+      final message = await controller.disableVaultSafely();
+      expect(message, contains('明文'));
+
+      // 磁盘上一天都不能剩锁
+      final onDisk = await store.loadAll();
+      expect(onDisk.every((e) => !e.isLocked), isTrue);
+      expect(onDisk.firstWhere((e) => sameDate(e.date, day)).body, '整天锁起来的秘密');
+      expect(
+        onDisk.firstWhere((e) => sameDate(e.date, second)).body,
+        '第一行\n按段锁的秘密',
+      );
+      // 保险库文件被删掉了，而且只删了一次
+      expect(files.deletes, 1);
+      expect(files.content, isNull);
+      expect(vault.isConfigured, isFalse);
+      controller.dispose();
+    });
+
+    test('关闭加密：有一天解不开就**拒绝关闭**，保险库文件必须还在', () async {
+      final files = FakeVaultFiles();
+      final vault = makeVault(files, root: root);
+      await vault.load();
+      await vault.setUp(passphrase);
+
+      final store = MemoryDiaryStore();
+      await store.save(await vault.lockWholeDay(entryFor(day, '能解开的')));
+      // 这一天的密文是坏的（模拟文件被改过、或者根本不是这把密钥锁的）
+      final broken = (await vault.lockWholeDay(entryFor(second, '解不开的')))
+          .copyWith(
+        lock: (await vault.lockWholeDay(entryFor(second, 'x'))).lock!.copyWith(
+              bodyCipher: 'v1:QUJDREVG',
+            ),
+      );
+      await store.save(broken);
+
+      final controller = DiaryController(
+        store: store,
+        deviceName: 'test',
+        vault: vault,
+      );
+      await controller.load();
+
+      await expectLater(
+        controller.disableVaultSafely(),
+        throwsA(isA<VaultAuthException>()),
+      );
+      // 关键：保险库文件绝不能被删——删了那天的内容就永久没了
+      expect(files.content, isNotNull);
+      expect(files.deletes, 0);
+      expect(vault.isConfigured, isTrue);
+      // 磁盘上那天的密文也原样还在
+      expect((await store.loadByDate(second))!.isLocked, isTrue);
+      controller.dispose();
+    });
+
+    test('从保险库那条路解锁之后，搜索自动包含锁着的正文', () async {
+      final files = FakeVaultFiles();
+      final vault = makeVault(files, root: root);
+      await vault.load();
+      await vault.setUp(passphrase);
+
+      final store = MemoryDiaryStore();
+      await store.save(await vault.lockWholeDay(entryFor(day, '只有我知道的秘密')));
+
+      final controller = DiaryController(
+        store: store,
+        deviceName: 'test',
+        vault: vault,
+      );
+      await controller.load();
+
+      // 还锁着：这一天不参与搜索
+      expect(controller.lockedNotSearchedCount, 1);
+      controller.setQuery('只有我知道');
+      expect(controller.visibleEntries, isEmpty);
+
+      // 从**保险库**这条路解锁（不是侧栏那个按钮）——控制器应当自己跟上
+      await vault.unlock(passphrase, isRecoveryCode: false);
+      await Future<void>.delayed(const Duration(milliseconds: 80));
+
+      expect(controller.lockedNotSearchedCount, 0,
+          reason: '解锁之后不该还挂着"没有参与搜索"');
+      controller.setQuery('只有我知道');
+      expect(controller.visibleEntries.length, 1,
+          reason: '解锁之后搜索必须能命中锁着的正文');
+      controller.dispose();
+    });
+
+    test('关闭加密：保存悄悄失败时，磁盘上仍有锁着的内容 → 照样拒绝', () async {
+      final files = FakeVaultFiles();
+      final vault = makeVault(files, root: root);
+      await vault.load();
+      await vault.setUp(passphrase);
+
+      // 这个存储**假装保存成功**、其实什么都没写。真实世界里对应的是
+      // "save 报成功但字段被写丢了"（本项目真出过这类 bug：编码时漏了
+      // 新字段，于是保存后再读回来就少东西）。
+      final store = _SilentlyFailingStore();
+      await store.save(await vault.lockWholeDay(entryFor(day, '锁着的')));
+      final written = await store.loadByDate(day);
+      expect(written!.isLocked, isTrue, reason: '先确认这份存储确实有内容');
+
+      final controller = DiaryController(
+        store: store,
+        deviceName: 'test',
+        vault: vault,
+      );
+      await controller.load();
+
+      await expectLater(
+        controller.disableVaultSafely(),
+        throwsA(isA<VaultAuthException>()),
+      );
+      expect(files.content, isNotNull, reason: '磁盘上还有锁着的内容时，保险库文件不能删');
+      expect(files.deletes, 0);
+      expect(vault.isConfigured, isTrue);
+      controller.dispose();
+    });
+
+    test('按次解锁是"用完即丢"：搜索框一清空，密钥和明文都没了', () async {
+      final files = FakeVaultFiles();
+      final vault = makeVault(files, root: root);
+      await vault.load();
+      await vault.setUp(passphrase);
+      final store = MemoryDiaryStore();
+      await store.save(await vault.lockWholeDay(entryFor(day, '只有我知道的秘密')));
+      vault.lock();
+
+      final controller = DiaryController(
+        store: store,
+        deviceName: 'test',
+        vault: vault,
+      );
+      await controller.load();
+
+      await vault.unlock(passphrase, isRecoveryCode: false, forSearchOnly: true);
+      await controller.prepareVaultForSearch();
+      expect(vault.isSearchRevealed, isTrue);
+      expect(controller.lockedNotSearchedCount, 0);
+
+      // 真的搜一下，然后清空 = 这次搜索结束
+      controller.setQuery('秘密');
+      controller.setQuery('');
+      expect(vault.isSearchRevealed, isFalse, reason: '按次解锁的密钥必须真的丢掉');
+      expect(vault.isUnlocked, isFalse);
+      expect(controller.lockedNotSearchedCount, 1, reason: '提示也该回来');
+      controller.dispose();
+    });
+
+    test('解锁状态下保存，字数会跟着更新（不再停在锁上那一刻）', () async {
+      final files = FakeVaultFiles();
+      final vault = makeVault(files, root: root);
+      await vault.load();
+      await vault.setUp(passphrase);
+      final store = MemoryDiaryStore();
+      await store.save(await vault.lockLine(entryFor(day, '第一行\n秘密一段'), 1));
+
+      final controller = DiaryController(
+        store: store,
+        deviceName: 'test',
+        vault: vault,
+      );
+      await controller.load(preferredDate: day);
+      await controller.openDate(day);
+      // 锁上那一刻记下的字数
+      expect(controller.currentCharacterCount, '第一行\n秘密一段'.runes.length);
+
+      // 在解锁状态下往这一天的正文里补一句
+      controller.updateBody('第一行改长了一点点\n████████');
+      await controller.saveNow();
+
+      final onDisk = await store.loadByDate(day);
+      expect(onDisk!.lock!.characters, '第一行改长了一点点\n秘密一段'.runes.length,
+          reason: '解锁状态下保存要重算完整字数');
+      controller.dispose();
+    });
+
+    test('整天锁的那天可以只读查看，磁盘上仍然是密文', () async {
+      final files = FakeVaultFiles();
+      final vault = makeVault(files, root: root);
+      await vault.load();
+      await vault.setUp(passphrase);
+
+      final store = MemoryDiaryStore();
+      await store.save(await vault.lockWholeDay(entryFor(day, '只想看一眼的内容')));
+      // 建完库本来就是解锁状态；这里先锁上，模拟"程序刚启动、还没输口令"
+      vault.lock();
+
+      final controller = DiaryController(
+        store: store,
+        deviceName: 'test',
+        vault: vault,
+      );
+      await controller.load();
+      await controller.openDate(day);
+
+      expect(controller.canReadLocked, isFalse, reason: '没解锁时不许读');
+      await vault.unlock(passphrase, isRecoveryCode: false);
+      final text = await controller.revealCurrentDayText();
+      expect(text, '只想看一眼的内容');
+      // 只读就是只读：磁盘上不能变成明文
+      expect((await store.loadByDate(day))!.isLocked, isTrue);
+      controller.dispose();
+    });
+  });
+}
+/// 只在**第一次**写入时真的落盘，之后就假装成功——用来验证
+/// "保存悄悄失败"时那条最后防线。
+class _SilentlyFailingStore extends MemoryDiaryStore {
+  bool _wroteOnce = false;
+
+  @override
+  Future<DiarySaveOutcome> save(DiaryEntry entry) async {
+    if (_wroteOnce) return const DiarySaveOutcome(wrote: false);
+    _wroteOnce = true;
+    return super.save(entry);
+  }
 }

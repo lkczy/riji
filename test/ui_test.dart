@@ -20,6 +20,7 @@ import 'package:riji/data/settings.dart';
 import 'package:riji/state/diary_controller.dart';
 import 'package:riji/state/reminder_service.dart';
 import 'package:riji/state/settings_controller.dart';
+import 'package:riji/state/vault_service.dart';
 import 'package:riji/ui/app.dart';
 import 'package:riji/ui/reminder_dialog.dart';
 
@@ -93,6 +94,7 @@ void main() {
     Size size = const Size(1400, 900),
     SettingsController? settings,
     ReleaseInfo? releaseInfo,
+    VaultService? vault,
   }) async {
     // 显式指定窗口尺寸：默认的 800x600 会让标题栏走窄屏分支，
     // 日期格式随之改变，断言就会对不上。桌面 App 的典型尺寸是宽屏。
@@ -100,7 +102,11 @@ void main() {
     tester.view.devicePixelRatio = 1.0;
     addTearDown(tester.view.reset);
 
-    final controller = DiaryController(store: store, deviceName: 'test');
+    final controller = DiaryController(
+      store: store,
+      deviceName: 'test',
+      vault: vault,
+    );
     await controller.load(preferredDate: date);
     // 取消控制器里所有挂起的定时器，否则测试结束会报 "Timer is still pending"
     addTearDown(controller.close);
