@@ -27,6 +27,13 @@ Future<void> writeSettingsJson(String json) async {}
 
 String exportDirectoryFor(String diaryRoot) => diaryRoot;
 
+/// 浏览器预览版没有加密功能：日记只存在内存里，没有"保险库文件"这回事。
+Future<String?> readVaultFile(String diaryRoot) async => null;
+
+Future<void> writeVaultFile(String diaryRoot, String content) async {}
+
+Future<void> deleteVaultFile(String diaryRoot) async {}
+
 Future<String> writeExportFile({
   required String directory,
   required String fileName,

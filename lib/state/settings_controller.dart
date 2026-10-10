@@ -150,6 +150,29 @@ class SettingsController extends ChangeNotifier {
   /// 提醒日（1=周一 … 7=周日），默认每天。
   List<int> get reminderWeekdays => _settings.reminderWeekdays;
 
+  /// 进入程序时是否要求口令。
+  bool get appLockEnabled => _settings.appLockEnabled;
+
+  /// 闲置多少分钟自动重新锁定（0 = 从不）。
+  int get appLockIdleMinutes => _settings.appLockIdleMinutes;
+
+  /// 「程序锁挡不住直接看文件的人」那段说明弹过没有。
+  bool get appLockNoticeShown => _settings.appLockNoticeShown;
+
+  Future<void> setAppLock({
+    bool? enabled,
+    int? idleMinutes,
+    bool? noticeShown,
+  }) async {
+    _settings = _settings.copyWith(
+      appLockEnabled: enabled,
+      appLockIdleMinutes: idleMinutes,
+      appLockNoticeShown: noticeShown,
+    );
+    notifyListeners();
+    await repository.save(_settings);
+  }
+
   /// 上一次成功装进系统时的指纹。见 [AppSettings.reminderApplied]。
   String? get reminderApplied => _settings.reminderApplied;
 

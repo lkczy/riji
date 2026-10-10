@@ -5,6 +5,7 @@ import 'package:path/path.dart' as p;
 
 import '../core/backup.dart';
 import '../core/reminder.dart';
+import '../core/vault_file.dart';
 
 import '../core/diary_location.dart';
 import '../core/diary_paths.dart';
@@ -135,6 +136,45 @@ Future<void> writeSettingsJson(String json) async {
   final temp = File('${file.path}.tmp');
   await temp.writeAsString(json, flush: true);
   await temp.rename(file.path);
+}
+
+// -----------------------------------------------------------------------------
+// 加密保险库
+// -----------------------------------------------------------------------------
+
+/// 保险库文件在**日记目录里**（不是 %APPDATA%）：备份和同步必须带上它，
+/// 否则一份备份就是一包谁都解不开的密文。见 `docs/加密设计.md`。
+File _vaultFile(String diaryRoot) => File(p.join(diaryRoot, VaultFile.fileName));
+
+Future<String?> readVaultFile(String diaryRoot) async {
+  try {
+    final file = _vaultFile(diaryRoot);
+    if (!await file.exists()) return null;
+    return await file.readAsString();
+  } catch (_) {
+    // 读不出来就当"没有保险库"，由上层明确提示，而不是假装一切正常
+    return null;
+  }
+}
+
+Future<void> writeVaultFile(String diaryRoot, String content) async {
+  final file = _vaultFile(diaryRoot);
+  await file.parent.create(recursive: true);
+
+  // 和设置、日记一样：先写临时文件再 rename。
+  // 这个文件写坏 = 主密钥丢了 = 所有锁着的日记都打不开，绝不能写一半。
+  final temp = File('${file.path}.tmp');
+  await temp.writeAsString(content, flush: true);
+  await temp.rename(file.path);
+}
+
+Future<void> deleteVaultFile(String diaryRoot) async {
+  try {
+    final file = _vaultFile(diaryRoot);
+    if (await file.exists()) await file.delete();
+  } catch (_) {
+    // 删不掉不算致命：界面上会说"保险库文件还在"
+  }
 }
 
 // -----------------------------------------------------------------------------

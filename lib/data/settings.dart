@@ -48,6 +48,9 @@ class AppSettings {
     this.reminderTime = '21:00',
     this.reminderWeekdays = allWeekdays,
     this.reminderApplied,
+    this.appLockEnabled = false,
+    this.appLockIdleMinutes = 10,
+    this.appLockNoticeShown = false,
     this.reminderLastShown,
   });
 
@@ -109,6 +112,20 @@ class AppSettings {
   /// 数组在编辑器里能看懂，坏了一眼也看得出坏在哪。
   final List<int> reminderWeekdays;
 
+  /// 进入程序时是否要求口令（"程序锁"）。**默认关**。
+  ///
+  /// 为什么它和加密是两件事：加密防的是"文件被拿走"，程序锁防的是
+  /// "别人用你已登录的电脑点开这个程序"。**程序锁挡不住会绕过程序去翻文件的人**
+  /// ——所以它是栅栏，不是保险柜，界面上必须写清。
+  final bool appLockEnabled;
+
+  /// 闲置多少分钟自动重新锁定。0 = 从不。
+  final int appLockIdleMinutes;
+
+  /// 「程序锁挡不住直接看文件的人」那段说明有没有弹过。
+  /// 只弹一次：每次都弹就成了噪音，一次都不弹又会让人误以为它等于全盘加密。
+  final bool appLockNoticeShown;
+
   /// 上一次**程序内**提醒是哪一天（`2026-10-08`）。
   ///
   /// 为什么需要它：程序内的检查是每几秒跑一次的轮询，"到点了"这个条件会一直
@@ -128,6 +145,9 @@ class AppSettings {
     String? reminderTime,
     List<int>? reminderWeekdays,
     String? reminderApplied,
+    bool? appLockEnabled,
+    int? appLockIdleMinutes,
+    bool? appLockNoticeShown,
     String? reminderLastShown,
     bool clearReminderApplied = false,
     bool clearReminderLastShown = false,
@@ -148,6 +168,12 @@ class AppSettings {
         reminderApplied: clearReminderApplied
             ? null
             : (reminderApplied ?? this.reminderApplied),
+        // 这里必须是 `?? this.xxx`。写成 fromJson 那种 `== true` / `: 10`，
+        // 会让**任何** copyWith（改主题、改备份目录……）都把程序锁重置掉——
+        // 用户实测到的"选了 5 分钟，整段自己关掉"就是这么来的。
+        appLockEnabled: appLockEnabled ?? this.appLockEnabled,
+        appLockIdleMinutes: appLockIdleMinutes ?? this.appLockIdleMinutes,
+        appLockNoticeShown: appLockNoticeShown ?? this.appLockNoticeShown,
         reminderLastShown: clearReminderLastShown
             ? null
             : (reminderLastShown ?? this.reminderLastShown),
@@ -169,6 +195,9 @@ class AppSettings {
         if (normalizeWeekdays(reminderWeekdays).length != allWeekdays.length)
           'reminderWeekdays': normalizeWeekdays(reminderWeekdays),
         if (reminderApplied != null) 'reminderApplied': reminderApplied,
+        if (appLockEnabled) 'appLockEnabled': true,
+        if (appLockIdleMinutes != 10) 'appLockIdleMinutes': appLockIdleMinutes,
+        if (appLockNoticeShown) 'appLockNoticeShown': true,
         if (reminderLastShown != null) 'reminderLastShown': reminderLastShown,
       };
 
@@ -190,6 +219,9 @@ class AppSettings {
     final reminderAt = json['reminderTime'];
     final reminderApplied = json['reminderApplied'];
     final reminderWeekdays = json['reminderWeekdays'];
+    final appLockEnabled = json['appLockEnabled'];
+    final appLockIdleMinutes = json['appLockIdleMinutes'];
+    final appLockNoticeShown = json['appLockNoticeShown'];
     final reminderLastShown = json['reminderLastShown'];
 
     return AppSettings(
@@ -227,6 +259,11 @@ class AppSettings {
               reminderApplied.trim().isNotEmpty
           ? reminderApplied
           : null,
+      appLockEnabled: appLockEnabled == true,
+      appLockIdleMinutes: appLockIdleMinutes is int && appLockIdleMinutes >= 0
+          ? appLockIdleMinutes
+          : 10,
+      appLockNoticeShown: appLockNoticeShown == true,
       reminderLastShown: reminderLastShown is String &&
               reminderLastShown.trim().isNotEmpty
           ? reminderLastShown

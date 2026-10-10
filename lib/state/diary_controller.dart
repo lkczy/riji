@@ -8,7 +8,10 @@ import '../core/day.dart';
 import '../core/diary_filter.dart';
 import '../core/history.dart';
 import '../core/models/diary_entry.dart';
+import '../core/vault_crypto.dart';
+import '../core/vault_format.dart';
 import '../core/writing_prompts.dart';
+import 'vault_service.dart';
 import '../data/diary_store.dart';
 import '../platform/platform.dart' as platform;
 
@@ -17,7 +20,48 @@ import '../platform/platform.dart' as platform;
 enum SaveState { idle, dirty, saving, saved, failed }
 
 class DiaryController extends ChangeNotifier {
-  DiaryController({required this.store, required this.deviceName});
+  DiaryController({
+    required this.store,
+    required this.deviceName,
+    this.vault,
+  }) {
+    vault?.addListener(_onVaultChanged);
+  }
+
+  /// 加密保险库。null = 这个构建/这个测试没有加密功能。
+  ///
+  /// 搜索和字数都要问它：锁着的正文是要先解密的，而"没参与搜索"和
+  /// "搜不到"必须分得清。
+  final VaultService? vault;
+
+  /// 正在预热（防止 [prepareVaultForSearch] 自己触发自己，转成死循环）。
+  bool _preparing = false;
+
+  /// 已经销毁。异步收尾时（自动预热、保存）必须看它一眼：
+  /// 解锁/锁定是随时可能发生的，而那些异步任务可能在控制器已经
+  /// dispose 之后才回来——那时再 notifyListeners() 会直接报错。
+  bool _disposed = false;
+
+  /// 保险库状态变了：**一解锁就自动把锁着的正文解进缓存**。
+  ///
+  /// 为什么在这里监听，而不是让每个调用方记得调：解锁有两条路
+  /// （「日记加密」对话框、侧栏的「解锁来搜索」）。漏掉任何一条，
+  /// 搜索都会**悄悄少几篇**——而界面上那句"另有 N 篇已锁"还会继续挂着，
+  /// 用户根本看不出搜的是个残缺的结果集。
+  void _onVaultChanged() {
+    final service = vault;
+    if (service == null || _disposed) return;
+    // 锁上了就别再显示原文了
+    if (!service.isUnlocked) _resetRevealMode();
+    if (!service.isUnlocked || _preparing) {
+      notifyListeners();
+      return;
+    }
+    _preparing = true;
+    unawaited(
+      prepareVaultForSearch().whenComplete(() => _preparing = false),
+    );
+  }
 
   final DiaryStore store;
   final String deviceName;
@@ -139,7 +183,7 @@ class DiaryController extends ChangeNotifier {
 
   int get totalEntries => _entries.length;
   int get totalCharacters =>
-      _entries.fold<int>(0, (sum, entry) => sum + entry.body.length);
+      _entries.fold<int>(0, (sum, entry) => sum + entry.characterCount);
 
   /// 今天算不算「写过」。
   bool get hasWrittenToday =>
@@ -166,13 +210,32 @@ class DiaryController extends ChangeNotifier {
 
       // 每个结构化字段都要能被搜到，否则用户搜"晴"却得到"没有匹配的日记"，
       // 会以为那天的天气没存下来。
-      return entry.body.toLowerCase().contains(needle) ||
+      //
+      // 正文这一项要问保险库：锁着的天要么已经解密在内存里（搜得到），
+      // 要么**根本没参与这次搜索**——那种情况界面上必须说出来，
+      // 否则"搜不到"和"没搜"就长得一模一样了。
+      final body = vault?.searchText(entry) ?? entry.body;
+      return body.toLowerCase().contains(needle) ||
           (entry.mood?.toLowerCase().contains(needle) ?? false) ||
           (entry.weather?.toLowerCase().contains(needle) ?? false) ||
           entry.tags.any((tag) => tag.toLowerCase().contains(needle)) ||
           formatIsoDate(entry.date).contains(needle);
     }).toList();
   }
+
+  /// 有几天的正文**没有参与这次搜索**（还锁着，或者解不开）。
+  ///
+  /// 界面必须把这个数字说出来："搜不到"和"没搜"是两件完全不同的事，
+  /// 让人以为"没写过"，是最不该发生的一种误导。
+  int get lockedNotSearchedCount {
+    final service = vault;
+    if (service == null) return 0;
+    return _entries.where((entry) => !service.participatesInSearch(entry)).length;
+  }
+
+  /// 现在还有几天是锁着的（不管解没解开）。
+  int get lockedEntriesCount =>
+      _entries.where((entry) => entry.isLocked).length;
 
   /// 所有用过的标签，按使用次数从多到少排。
   /// 常用的排前面：标签自动补全时，最可能想输入的就该在最上面。
@@ -245,6 +308,8 @@ class DiaryController extends ChangeNotifier {
   // ---------------------------------------------------------------------------
 
   Future<void> openDate(DateTime date) async {
+    // 换天要退出「显示原文」：否则屏幕上会留着**别的日子**的解密内容
+    if (!isSameDay(date, _selectedDate)) _resetRevealMode();
     if (isSameDay(date, _selectedDate) && _current != null) {
       notifyListeners();
       return;
@@ -348,6 +413,14 @@ class DiaryController extends ChangeNotifier {
   void setQuery(String value) {
     if (value == _query) return;
     _query = value;
+
+    // 「按次解锁」是**只为这一次搜索**解密，用完就得丢。
+    //
+    // 搜索框一清空就是"这次搜索结束了"——此时把密钥和明文缓存一起扔掉。
+    // 少了这一步，那句"用完即丢"就只是一句注释：密钥会一直留在内存里
+    // 直到关掉程序，而那并不是用户选那一档时同意的事。
+    if (value.trim().isEmpty) vault?.releaseSearchReveal();
+
     notifyListeners();
   }
 
@@ -398,6 +471,276 @@ class DiaryController extends ChangeNotifier {
     _saveTimer = Timer(saveDelay, () => unawaited(saveNow()));
   }
 
+  /// 正文里的黑条数和密文数对不上时，给出一句人话；对得上就是 null。
+  ///
+  /// 只看"黑条多出来"这一边：密文多出来（用户删掉了一行黑条）是允许的，
+  /// 多余的密文会原样保留。
+  String? _lockMismatchError() {
+    final lock = _current?.lock;
+    if (lock == null || !lock.isLocked) return null;
+    if (lock.isWholeDay) return null;
+    return barsMismatchError(_body, lock.redactions.length);
+  }
+  // ---------------------------------------------------------------------------
+  // 加密：上锁 / 解锁
+  //
+  // 所有落盘都走同一个出口（[_applyLock] → saveNow），所以"锁着的天写成
+  // 明文"这条路在结构上就不存在——这是 `docs/加密设计.md` 第 4 节那条纪律。
+  // ---------------------------------------------------------------------------
+
+  /// 当前这一天在底栏显示的**字数**。
+  ///
+  /// 锁着的天正文是空的（整天锁）或带黑条（按段锁），用 `_body` 算会显示成
+  /// 0 字或算进黑条——两种都在骗人。所以问条目，条目里存着锁上那一刻的
+  /// 完整字数（见 `docs/DATA-FORMAT.md` 的 `chars`）。
+  int get currentCharacterCount => _current?.characterCount ?? _body.runes.length;
+  /// 当前这一天的**正文**是不是只读。
+  ///
+  /// 锁着、又没解锁（或者只是"为搜索解锁"）时，正文一律不许改——
+  /// 这样"把黑条改坏、内容和密文对不上"这件事从源头就不存在了，
+  /// 保存护栏退化成第二道防线。
+  ///
+  /// **只锁正文**：心情、天气、标签是明文的，锁定状态下补一个心情照样可以。
+  bool get isCurrentBodyReadOnly => currentDayIsLocked && !canLock;
+
+  /// 能不能对当前这一天做加密操作（需要已解锁、且不是"只为搜索"那种解锁）。
+  bool get canLock => vault?.canWrite ?? false;
+
+  bool get currentDayIsLocked => _current?.isLocked ?? false;
+
+  bool get currentDayIsWholeDayLocked => _current?.lock?.isWholeDay ?? false;
+
+  /// 光标所在那一行能不能锁：要有内容、不是空行、不是黑条、也不是整天锁。
+  bool canLockLine(int lineIndex) {
+    if (!canLock || currentDayIsWholeDayLocked) return false;
+    final lines = _body.split('\n');
+    if (lineIndex < 0 || lineIndex >= lines.length) return false;
+    final line = lines[lineIndex];
+    if (line.trim().isEmpty) return false;
+    return !isRedactionLine(line);
+  }
+
+  /// 光标所在那一行是不是黑条（决定菜单里显示"解开这一段"还是"锁上这一段"）。
+  bool lineIsRedacted(int lineIndex) {
+    final lines = _body.split('\n');
+    if (lineIndex < 0 || lineIndex >= lines.length) return false;
+    return isRedactionLine(lines[lineIndex]);
+  }
+
+  /// 锁上整天。
+  Future<void> lockCurrentDay() async {
+    final service = _requireVault();
+    final entry = _ensureEntry();
+    await _applyLock(await service.lockWholeDay(entry));
+  }
+
+  /// 解开整天（变回明文存盘）。调用方负责先确认。
+  Future<void> unlockCurrentDay() async {
+    final service = _requireVault();
+    final entry = _current;
+    if (entry == null) return;
+    await _applyLock(await service.unlockWholeDay(entry));
+  }
+
+  /// 锁上某一行。
+  Future<void> lockCurrentLine(int lineIndex) async {
+    final service = _requireVault();
+    final entry = _ensureEntry();
+    await _applyLock(await service.lockLine(entry, lineIndex));
+  }
+
+  /// 解开某一行。
+  Future<void> unlockCurrentLine(int lineIndex) async {
+    final service = _requireVault();
+    final entry = _current;
+    if (entry == null) return;
+    await _applyLock(await service.unlockLine(entry, lineIndex));
+  }
+
+  /// 手动/自动锁定**整个程序**。
+  ///
+  /// 两件事一起做，缺一不可：
+  ///   1. 丢掉密钥（`vault.lock()`）
+  ///   2. **清空内存里的日记内容**——明文的日子本来就以明文读进了内存，
+  ///      只丢密钥的话，"锁上"就只是屏幕上看不见，内存里还在。
+  ///
+  /// 先 `_flush()` 再清：万一还有没落盘的编辑，锁定不能把它吃掉。
+  Future<void> lockApp() async {
+    await _flush();
+    vault?.lock();
+    _entries = <DiaryEntry>[];
+    _conflicts = <ConflictFile>[];
+    _recoverableDrafts = <DateTime>[];
+    _current = null;
+    _body = '';
+    _mood = null;
+    _weather = null;
+    _tags = <String>[];
+    _query = '';
+    _resetRevealMode();
+    _saveState = SaveState.idle;
+    notifyListeners();
+  }
+
+  /// 解锁之后把内容读回来（锁定是把内存清空了的）。
+  Future<void> reloadAfterUnlock() async {
+    await load(preferredDate: _selectedDate);
+  }
+
+  /// 「显示原文」模式：整篇把黑条换成原文，**只读**。
+  ///
+  /// 这是"能看见、改不着"的落点：编辑框里的内容换成解出来的原文，
+  /// 但**真正的正文控制器一个字都不动**（那才是要落盘的东西），
+  /// 而且这个模式下输入框是只读的——不会有人把明文敲进去。
+  bool _revealMode = false;
+  String? _revealText;
+
+  bool get revealMode => _revealMode;
+
+  /// 要显示的原文（只在 [revealMode] 为 true 时有值）。
+  String? get revealedText => _revealMode ? _revealText : null;
+
+  /// 现在能不能进「显示原文」：这一天锁着、而且已经解锁（按次解锁也算）。
+  bool get canRevealOriginal => currentDayIsLocked && canReadLocked;
+
+  Future<void> enterRevealMode() async {
+    if (!canRevealOriginal) return;
+    final text = await revealCurrentDayText();
+    if (_disposed) return;
+    _revealText = text;
+    _revealMode = true;
+    notifyListeners();
+  }
+
+  void exitRevealMode() {
+    if (!_revealMode) return;
+    _revealMode = false;
+    _revealText = null;
+    notifyListeners();
+  }
+
+  /// 内部用：换天、锁定、上锁/解锁之后都要退出这个模式（否则会显示别的日子的原文）。
+  void _resetRevealMode() {
+    _revealMode = false;
+    _revealText = null;
+  }
+
+  /// 能不能**只读地**看锁着的内容。按次解锁（只为搜索）也算——它本来就有密钥。
+  bool get canReadLocked => vault?.isUnlocked ?? false;
+
+  /// 读当前这一天的完整明文（只读浮窗用，**绝不写回编辑框**）。
+  ///
+  /// 整天锁的那天没有黑条可点，只能走这条路才看得到内容——否则用户为了
+  /// "看一眼"就不得不把它解成明文存在磁盘上。
+  Future<String> revealCurrentDayText() async {
+    final service = _requireVault();
+    final entry = _current;
+    if (entry == null) {
+      throw const VaultAuthException('这一天还没有内容。');
+    }
+    return service.revealDayText(entry);
+  }
+
+  /// 看某一段黑条的原文（只读）。
+  Future<String> revealLine(int lineIndex) {
+    final service = _requireVault();
+    final entry = _current;
+    if (entry == null) throw const VaultAuthException('这一天还没有内容。');
+    return service.revealRedaction(entry, lineIndex);
+  }
+
+  /// 关闭加密：**先把所有锁着的天解开并落盘**，确认磁盘上一天都没锁着，
+  /// 才去删保险库文件。
+  ///
+  /// 顺序绝不能反。`.vault` 里装的是主密钥，先删它等于把那几天的内容
+  /// 永久扔掉——没有备份、没有后门。所以这里宁可**拒绝关闭**并说清原因，
+  /// 也不冒这个险。
+  ///
+  /// （之前这里直接调 `disableVault()`，没有这道闸：点一下就可能丢数据。）
+  Future<String> disableVaultSafely() async {
+    final service = _requireVault();
+    if (!service.isUnlocked) {
+      throw const VaultAuthException('先解锁，才能关闭加密。');
+    }
+    if (service.isSearchRevealed) {
+      throw const VaultAuthException('现在只是"为搜索解锁"，不能关加密。');
+    }
+
+    final locked = _entries.where((entry) => entry.isLocked).toList();
+    final failed = <String>[];
+    for (final entry in locked) {
+      try {
+        final opened = await service.unlockWholeDay(entry);
+        await store.save(opened);
+        _mergeIn(opened);
+        if (isSameDay(entry.date, _selectedDate)) {
+          // 当前这一天正好解开了：编辑框要立刻反映出来
+          _current = opened;
+          _body = opened.body;
+          _bodyRevision++;
+        }
+      } catch (_) {
+        failed.add(formatIsoDate(entry.date));
+      }
+    }
+
+    if (failed.isNotEmpty) {
+      throw VaultAuthException(
+        '有 ${failed.length} 天解不开（${failed.join('、')}），所以**没有**关闭加密：'
+        '先删保险库文件的话，那些内容就永久打不开了。',
+      );
+    }
+
+    // 不信内存，只信落盘的结果：重新从磁盘读一遍，确认真的没有锁着的天了
+    final onDisk = await store.loadAll();
+    final stillLocked = onDisk.where((entry) => entry.isLocked).toList();
+    if (stillLocked.isNotEmpty) {
+      throw VaultAuthException(
+        '磁盘上还有 ${stillLocked.length} 天是锁着的，没有关闭加密。',
+      );
+    }
+
+    final result = await service.disableVault();
+    if (!result.ok) throw VaultAuthException(result.message);
+    _entries = onDisk;
+    notifyListeners();
+    return '加密已关闭：${onDisk.length} 天的内容都回到明文了。';
+  }
+
+  /// 解锁之后把锁着的正文解进内存缓存，让搜索能用上。
+  ///
+  /// 解不开的那些天会被报出来（文件坏了、或者不是用这个密钥锁的），
+  /// 界面必须把它们算进"另有 N 篇未参与搜索"。
+  Future<int> prepareVaultForSearch() async {
+    final service = vault;
+    if (service == null) return 0;
+    final failed = await service.prepare(_entries);
+    if (!_disposed) notifyListeners();
+    return failed.length;
+  }
+  VaultService _requireVault() {
+    final service = vault;
+    if (service == null) {
+      throw const VaultAuthException('这个构建没有加密功能。');
+    }
+    return service;
+  }
+
+  /// 把改好的条目接过来、落盘。
+  ///
+  /// 注意 `_body` 也跟着换：锁上整天之后正文是空的，编辑框必须立刻反映出来
+  /// ——否则界面上还显示着明文，用户以为"没锁上"。
+  Future<void> _applyLock(DiaryEntry entry) async {
+    _resetRevealMode();
+    _current = entry;
+    _body = entry.body;
+    _bodyRevision++;
+    _mergeIn(entry);
+    _saveState = SaveState.dirty;
+    notifyListeners();
+    await saveNow();
+  }
+
   Future<void> saveNow() async {
     _saveTimer?.cancel();
     _saveTimer = null;
@@ -422,8 +765,37 @@ class DiaryController extends ChangeNotifier {
     notifyListeners();
 
     final date = _selectedDate;
+
+    // ⚠️ 加密护栏：正文里的黑条比密文多，**绝不许落盘**。
+    //
+    // 那种文件在界面上看着"锁着"，其实那些黑条底下什么都没有——
+    // 一搜就搜得到，而用户以为它是锁着的。这是这个功能能造成的
+    // 最坏的一种谎，所以宁可拒绝保存并说清楚，也不写下去。
+    // （会走到这里的真实路径：用户手打了一行方块，或者恢复了黑条数
+    //   和密文对不上的草稿。）
+    final mismatch = _lockMismatchError();
+    if (mismatch != null) {
+      _saveState = SaveState.failed;
+      _saveError = mismatch;
+      notifyListeners();
+      return;
+    }
+
     try {
-      final entry = _ensureEntry();
+      var entry = _ensureEntry();
+
+      // 锁着的天：字数用锁里存的那份。但如果**现在是解锁状态**，就能把
+      // 被锁的段也解开、算出准确字数——那就顺手更新掉，否则热力图和底栏
+      // 会一直停在锁上那一刻的旧值（而且用户完全看不出来）。
+      final service = vault;
+      if (entry.lock != null && (service?.canWrite ?? false)) {
+        try {
+          entry = await service!.refreshCharacters(entry);
+        } catch (_) {
+          // 解不开就算了，保留旧值。**绝不因为算字数失败而挡住保存**
+        }
+      }
+
       final outcome = await store.save(entry);
       _mergeIn(entry);
       // 刚写完盘，把基准更新成「磁盘上现在就是这一份」，否则下一轮外部
@@ -765,8 +1137,21 @@ class DiaryController extends ChangeNotifier {
       ..writeln()
       ..writeln('- 导出时间：${formatIso8601WithOffset(now)}')
       ..writeln('- 条目数：${_entries.length}')
-      ..writeln('- 总字数：$totalCharacters')
-      ..writeln();
+      ..writeln('- 总字数：$totalCharacters');
+
+    // 锁着的天：导出的**是明文**。
+    //
+    // 导出这件事本身就是"我要拿出去用"，所以这里按设计解密（见
+    // `docs/加密设计.md`）；但必须在导出文件里留下明确的痕迹——
+    // 复制的这一份不再受加密保护，人得知道。
+    final lockedCount = lockedEntriesCount;
+    if (lockedCount > 0) {
+      buffer
+        ..writeln('- ⚠️ 其中 **$lockedCount 天原来是加密的**，这份导出里是**明文**，'
+            '请当作未加密的副本保管')
+        ..writeln('- （还没解锁的那些天在下面是黑条或空白，先解锁再导出才能带上原文）');
+    }
+    buffer.writeln();
 
     // 按时间正序，读起来像一本书
     final ordered = _entries.toList()
@@ -790,7 +1175,7 @@ class DiaryController extends ChangeNotifier {
 
       buffer
         ..writeln()
-        ..writeln(entry.body)
+        ..writeln(vault?.searchText(entry) ?? entry.body)
         ..writeln();
     }
 
@@ -930,6 +1315,8 @@ class DiaryController extends ChangeNotifier {
 
   @override
   void dispose() {
+    _disposed = true;
+    vault?.removeListener(_onVaultChanged);
     _draftTimer?.cancel();
     _saveTimer?.cancel();
     super.dispose();

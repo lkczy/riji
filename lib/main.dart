@@ -10,6 +10,7 @@ import 'platform/platform.dart' as platform;
 import 'state/diary_controller.dart';
 import 'state/reminder_service.dart';
 import 'state/settings_controller.dart';
+import 'state/vault_service.dart';
 import 'ui/app.dart';
 
 Future<void> main(List<String> args) async {
@@ -94,7 +95,17 @@ class _RijiBootstrapState extends State<RijiBootstrap> {
         rootPath: stored.diaryRoot,
         device: device,
       );
-      final controller = DiaryController(store: store, deviceName: device);
+      // 加密保险库：读一下日记目录里的 `.vault`（没有就是没开加密）。
+      // 只读一个小文件，不派生密钥——**启动时绝不要求口令**，
+      // "打开即写"这条不能因为加密而破掉。
+      final vault = VaultService(diaryRoot: stored.diaryRoot);
+      await vault.load();
+
+      final controller = DiaryController(
+        store: store,
+        deviceName: device,
+        vault: vault,
+      );
 
       // 每日提醒对一次账：改了时间 / 换了日记目录 / 程序挪了位置 / 任务被手工
       // 删了，都在这里自己修好。指纹一致时一次子进程都不起，所以不拖慢启动。
@@ -169,7 +180,15 @@ class _RijiBootstrapState extends State<RijiBootstrap> {
     // 3. 换存储和控制器
     final device = platform.deviceName;
     final store = platform.createStore(rootPath: newRoot, device: device);
-    final controller = DiaryController(store: store, deviceName: device);
+    // 保险库也要跟着换。加密是**跟着日记目录走**的：新目录里可能就有锁着的天。
+    // 这里漏掉的话，界面上会显示 🔒 却怎么也解不开——那些内容等于丢失。
+    final vault = VaultService(diaryRoot: newRoot);
+    await vault.load();
+    final controller = DiaryController(
+      store: store,
+      deviceName: device,
+      vault: vault,
+    );
     await controller.load();
 
     // 4. 持久化
