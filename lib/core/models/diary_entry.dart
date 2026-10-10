@@ -1,5 +1,6 @@
 import '../day.dart';
 import '../ulid.dart';
+import '../vault_format.dart';
 
 /// 一条日记。
 ///
@@ -16,6 +17,7 @@ class DiaryEntry {
     this.mood,
     this.weather,
     this.tags = const <String>[],
+    this.lock,
     this.extraFrontMatter = '',
   });
 
@@ -42,6 +44,12 @@ class DiaryEntry {
   final String? weather;
 
   final List<String> tags;
+
+  /// 这天的上锁状态。null = 明文（绝大多数日子）。
+  ///
+  /// 见 `lib/core/vault_format.dart` 和 `docs/加密设计.md`：锁上的内容
+  /// **就在这个文件里**（front matter 的 `enc-*` 字段），不是搬到别处去了。
+  final DayLock? lock;
 
   /// 程序不认识的 front matter 原文，逐字节保留，重新保存时原样写回。
   ///
@@ -100,11 +108,45 @@ class DiaryEntry {
 
   bool get hasLegacyId => id.startsWith('legacy-');
 
-  bool get isEmpty =>
-      body.trim().isEmpty &&
-      (mood == null || mood!.isEmpty) &&
-      (weather == null || weather!.isEmpty) &&
-      tags.isEmpty;
+  /// 这一天有没有任何锁。
+  bool get isLocked => lock?.isLocked ?? false;
+
+  /// 是不是"空的一天"。
+  ///
+  /// ⚠️ **锁着的天算有内容。** 否则日历的"写过没有"、每日提醒的"今天写没写"
+  /// 都会把一整天锁着的日记当成没写——那是最容易发生、也最难发现的错。
+  bool get isEmpty {
+    if (isLocked) return false;
+    return body.trim().isEmpty &&
+        (mood == null || mood!.isEmpty) &&
+        (weather == null || weather!.isEmpty) &&
+        tags.isEmpty;
+  }
+
+  /// 这一天的字数：锁着的时候用锁里存的（正文是密文或黑条，算不出来）。
+  ///
+  /// 明文的天按**码点**算（`runes`），和热力图/统计的口径一致。
+  int get characterCount => lock?.characters ?? body.runes.length;
+
+  /// 列表、搜索结果里显示的那一行。
+  ///
+  /// 锁着的天必须**一眼看得出来锁了**，而且**两种锁要能分清**：
+  ///   · 整天锁：🔒（整篇都看不见）
+  ///   · 部分黑条：⬛（只是几段看不见——用它左边那个方块，因为它就是黑条本身）
+  ///
+  /// 为什么不复用同一个锁图标：两者的"看不见的程度"完全不同，
+  /// 一个图标会让人以为"整篇都锁了"，从而不敢去读还能读的部分。
+  String get listPreview {
+    final current = lock;
+    if (current == null || !current.isLocked) return preview;
+    if (current.isWholeDay) return '🔒 已加密';
+
+    final badge = '⬛ ${current.redactions.length} 段黑条';
+    final text = preview;
+    // 第一行本身就是黑条时，没必要再把黑条当标题显示一遍
+    if (text.isEmpty || isRedactionLine(text)) return badge;
+    return '$badge · $text';
+  }
 
   /// 正文首行，用作列表和搜索结果里的标题。
   String get preview {
@@ -129,6 +171,8 @@ class DiaryEntry {
     String? weather,
     bool clearWeather = false,
     List<String>? tags,
+    DayLock? lock,
+    bool clearLock = false,
     String? extraFrontMatter,
   }) {
     return DiaryEntry(
@@ -141,10 +185,12 @@ class DiaryEntry {
       mood: clearMood ? null : (mood ?? this.mood),
       weather: clearWeather ? null : (weather ?? this.weather),
       tags: tags ?? this.tags,
+      lock: clearLock ? null : (lock ?? this.lock),
       extraFrontMatter: extraFrontMatter ?? this.extraFrontMatter,
     );
   }
 
   @override
-  String toString() => 'DiaryEntry($id, ${formatIsoDate(date)}, ${body.length} 字)';
+  String toString() => 'DiaryEntry($id, ${formatIsoDate(date)}, '
+      '${body.length} 字${isLocked ? '，已加密' : ''})';
 }

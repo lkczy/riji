@@ -51,7 +51,7 @@ class DayWriting {
   /// 不要用 `entry.date`——两边都必须过 `dateOnly`，否则会整天错位。
   factory DayWriting.fromEntry(DateTime date, DiaryEntry entry) => DayWriting(
         date: date,
-        characters: entry.body.runes.length,
+        characters: entry.characterCount,
         // 复用模型层已有的定义，不要在这里再拼一遍"什么算写过"。
         hasContent: !entry.isEmpty,
         mood: entry.mood,

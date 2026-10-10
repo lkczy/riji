@@ -2,6 +2,8 @@ import 'package:yaml/yaml.dart';
 
 import 'day.dart';
 import 'models/diary_entry.dart';
+import 'vault_crypto.dart';
+import 'vault_format.dart';
 
 /// Markdown 文件与 [DiaryEntry] 之间的转换。
 ///
@@ -49,6 +51,37 @@ class DiaryCodec {
       buffer.writeln('tags:');
       for (final tag in entry.tags) {
         buffer.writeln('  - ${_scalar(tag)}');
+      }
+    }
+
+    // 加密字段。见 `lib/core/vault_format.dart` 与 `docs/加密设计.md`。
+    //
+    // ⚠️ 放在**正文之前、已知字段之后**，而且刻意放进 front matter：
+    // v1.0.0 起的旧版本会把不认识的键原样收进 extraFrontMatter 再写回，
+    // 所以旧版本打开这种文件只会觉得"这天没正文"，**不会弄坏密文**。
+    // 反过来把密文写在正文位置的话，旧版本里随手编辑一下就会在密文后面
+    // 追加一行，那天的日记将永久打不开。
+    final lock = entry.lock;
+    if (lock != null && lock.isLocked) {
+      buffer.writeln('enc: ${_scalar(lock.version)}');
+      final params = lock.params;
+      if (params != null) {
+        buffer.writeln('enc-params: ${_scalar(params.encode())}');
+      }
+      final characters = lock.characters;
+      if (characters != null) {
+        // 刻意不加引号：让人和程序都一眼看出这是个数字
+        buffer.writeln('chars: $characters');
+      }
+      final bodyCipher = lock.bodyCipher;
+      if (bodyCipher != null) {
+        buffer.writeln('enc-body: ${_scalar(bodyCipher)}');
+      }
+      if (lock.redactions.isNotEmpty) {
+        buffer.writeln('enc-redactions:');
+        for (final key in lock.redactions.keys) {
+          buffer.writeln('  $key: ${_scalar(lock.redactions[key]!)}');
+        }
       }
     }
 
@@ -145,6 +178,7 @@ class DiaryCodec {
     final mood = text('mood');
     final weather = text('weather');
     final tags = _parseTags(frontMatter?['tags']);
+    final lock = _parseLock(frontMatter);
 
     return DiaryEntry(
       id: id,
@@ -156,7 +190,53 @@ class DiaryCodec {
       mood: mood,
       weather: weather,
       tags: tags,
+      lock: lock,
       extraFrontMatter: extraFrontMatter,
+    );
+  }
+
+  /// 解析加密字段。
+  ///
+  /// 态度和正文一样：**宁可少认，也不丢**。所以：
+  ///   · 密文在、参数认不出来 → 这天的锁照样建起来（`params` 为 null），
+  ///     界面会老实说"参数不认识，打不开"，而不是显示成"这天没内容"
+  ///   · `enc-body` 和 `enc-redactions` 同时存在（理论上不该发生）→ 两个
+  ///     都留着，整天密文优先显示；重新保存时原样写回，不替用户销毁东西
+  static DayLock? _parseLock(Map<dynamic, dynamic>? frontMatter) {
+    if (frontMatter == null) return null;
+    final version = frontMatter['enc'];
+    final bodyCipher = frontMatter['enc-body'];
+    final rawRedactions = frontMatter['enc-redactions'];
+    final hasRedactions = rawRedactions is Map && rawRedactions.isNotEmpty;
+    if (version == null && bodyCipher == null && !hasRedactions) return null;
+
+    final redactions = <String, String>{};
+    if (rawRedactions is Map) {
+      for (final entry in rawRedactions.entries) {
+        final key = entry.key?.toString().trim() ?? '';
+        final value = entry.value?.toString().trim() ?? '';
+        if (key.isNotEmpty && value.isNotEmpty) redactions[key] = value;
+      }
+    }
+
+    final rawParams = frontMatter['enc-params'];
+    final params = KdfParams.tryParse(rawParams?.toString());
+
+    final rawChars = frontMatter['chars'];
+    final characters = rawChars is int
+        ? rawChars
+        : int.tryParse(rawChars?.toString().trim() ?? '');
+
+    return DayLock(
+      version: (version?.toString().trim().isNotEmpty ?? false)
+          ? version.toString().trim()
+          : vaultVersion,
+      params: params,
+      bodyCipher: (bodyCipher?.toString().trim().isNotEmpty ?? false)
+          ? bodyCipher.toString().trim()
+          : null,
+      redactions: redactions,
+      characters: characters,
     );
   }
 
@@ -174,6 +254,12 @@ class DiaryCodec {
     'mood',
     'weather',
     'tags',
+    // 加密相关。加新字段时**必须**同时加到这里，见上面那段注释。
+    'enc',
+    'enc-params',
+    'enc-body',
+    'enc-redactions',
+    'chars',
   };
 
   static final RegExp _topLevelKey = RegExp(r'^([A-Za-z0-9_\-]+):');
