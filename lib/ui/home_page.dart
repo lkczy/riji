@@ -22,6 +22,7 @@ import 'diary_actions.dart';
 import 'diary_location_dialog.dart';
 import 'editor_panel.dart';
 import 'entry_list_panel.dart';
+import 'notices.dart';
 import 'markdown_formatting.dart';
 import 'prompts.dart';
 import 'reminder_dialog.dart';
@@ -410,6 +411,18 @@ class _DiaryHomePageState extends State<DiaryHomePage>
   /// 面板挂在**这里**而不是 `EditorPanel` 里，因为 Ctrl+K 必须在侧栏搜索框、
   /// 心情/天气/标签输入框都有焦点时也能用——那些控件是写作区的兄弟或别的子树，
   /// 藏在 `EditorPanel` 内部就够不到它们了。
+  /// 立即锁定（`Ctrl+L`，命令面板里也有）。
+  void _lockNow() {
+    final vault = widget.controller.vault;
+    if (vault == null || !vault.isConfigured || !vault.isUnlocked) return;
+    if (widget.settings.appLockEnabled) {
+      unawaited(widget.controller.lockApp());
+      return;
+    }
+    vault.lock();
+    showNotice(context, '已锁定：需要重新输口令才能看锁着的内容。');
+  }
+
   Future<void> _openCommandPalette() async {
     // 已经开着就不要再开一层：连按两次 Ctrl+K 应该是"没反应"，
     // 而不是叠出第二个面板（第二个关掉之后第一个还在，很难受）。
@@ -537,6 +550,80 @@ class _DiaryHomePageState extends State<DiaryHomePage>
           keywords: const <String>['快照', '版本', '历史', '留一份', 'snapshot'],
           enabled: controller.hasEntry,
           disabledReason: '今天还没写过，没有可留的版本',
+        ),
+      ),
+
+      // ---------------------------------------------------------------- 加密
+      //
+      // 只在真有保险库（或能建库）时出现。命令面板里也放一份，
+      // 和「⋮」菜单共用同一个实现。
+      if (controller.vault != null)
+        CommandAction(
+          icon: Icons.enhanced_encryption_outlined,
+          run: () async => openVaultAction(context, controller, settings: settings),
+          command: const PaletteCommand(
+            id: 'settings.vault',
+            title: '日记加密',
+            subtitle: '设口令、解锁、加密某几天或某几段',
+            keywords: <String>[
+              '加密',
+              '密码',
+              '口令',
+              '锁',
+              '黑条',
+              'vault',
+              'encrypt',
+            ],
+          ),
+        ),
+      if (controller.vault != null)
+        CommandAction(
+          icon: Icons.lock_outline,
+          run: () async => lockWholeDayAction(context, controller),
+          command: PaletteCommand(
+            id: 'vault.lockDay',
+            title: '加密这一天',
+            keywords: const <String>[
+              '加密', '上锁', '锁', '整天', '这一天', 'encrypt', 'lock',
+            ],
+            enabled: controller.canLock && !controller.currentDayIsLocked,
+            disabledReason: !controller.canLock
+                ? '需要先在「日记加密」里解锁'
+                : '这一天已加密',
+          ),
+        ),
+
+      // 解密这一天：和加密对称，搜「解密」也该找得到
+      CommandAction(
+        icon: Icons.lock_open,
+        run: () async => unlockWholeDayAction(context, controller),
+        command: PaletteCommand(
+          id: 'vault.unlockDay',
+          title: '解密这一天',
+          keywords: const <String>[
+            '解密', '解锁', '解开', '变明文', '这一天', 'decrypt', 'unlock',
+          ],
+          enabled: controller.canLock && controller.currentDayIsWholeDayLocked,
+          disabledReason: !controller.canLock
+              ? '需要先在「日记加密」里解锁'
+              : '这一天没有整天加密',
+        ),
+      ),
+
+      // 显示原文（只读）：不用把内容解密落盘就能读
+      CommandAction(
+        icon: Icons.visibility_outlined,
+        run: () async => revealWholeDayAction(context, controller),
+        command: PaletteCommand(
+          id: 'vault.reveal',
+          title: '显示原文（只读）',
+          keywords: const <String>[
+            '显示原文', '看原文', '只读', '黑条', 'reveal', 'preview',
+          ],
+          enabled: controller.canRevealOriginal,
+          disabledReason: controller.currentDayIsLocked
+              ? '需要先在「日记加密」里解锁'
+              : '这一天没有加密',
         ),
       ),
 
@@ -898,6 +985,11 @@ class _DiaryHomePageState extends State<DiaryHomePage>
       bindings: <ShortcutActivator, VoidCallback>{
         const SingleActivator(LogicalKeyboardKey.keyK, control: true):
             () => unawaited(_openCommandPalette()),
+        // 紧急锁定：有人走过来时按一下就走。
+        // 开了程序锁 → 连内存里的日记一起清掉（回到锁屏）；
+        // 没开程序锁 → 只丢密钥（锁着的天照旧显示 🔒/黑条，不会看起来像数据没了）。
+        const SingleActivator(LogicalKeyboardKey.keyL, control: true):
+            _lockNow,
       },
       child: Scaffold(
         body: LayoutBuilder(
@@ -912,6 +1004,7 @@ class _DiaryHomePageState extends State<DiaryHomePage>
                     width: narrow ? 250 : 320,
                     child: EntryListPanel(
                       controller: controller,
+                      settings: widget.settings,
                       onPickDate: _pickDate,
                       searchFocus: _searchFocus,
                     ),

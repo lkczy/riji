@@ -21,9 +21,11 @@ import 'backup_dialog.dart';
 import 'filter_dialog.dart';
 import 'history_dialog.dart';
 import 'markdown_formatting.dart';
+import 'notices.dart';
 import 'reminder_dialog.dart';
 import 'trash_dialog.dart';
 import 'typography_dialog.dart';
+import 'vault_dialog.dart';
 
 /// 在资源管理器里定位日记文件夹。失败要说话：静默失败会让用户以为程序卡了。
 Future<void> revealDiaryFolderAction(
@@ -174,6 +176,183 @@ Future<void> deleteCurrentEntryAction(
   messenger.showSnackBar(
     SnackBar(content: Text('已删除 ${formatIsoDate(date)} 的日记，可在「回收站」里找回。')),
   );
+}
+
+/// 日记加密：保险库级别的设置（设口令、解锁、锁定、关闭）。
+Future<void> openVaultAction(
+  BuildContext context,
+  DiaryController controller, {
+  SettingsController? settings,
+}) async {
+  final vault = controller.vault;
+  if (vault == null) return;
+  await showVaultDialog(
+    context,
+    vault: vault,
+    controller: controller,
+    settings: settings,
+  );
+}
+
+/// 锁上**整天**：正文变空，整篇密文留在 front matter 里。
+Future<void> lockWholeDayAction(
+  BuildContext context,
+  DiaryController controller,
+) async {
+  final messenger = ScaffoldMessenger.of(context);
+  await controller.lockCurrentDay();
+  showNoticeOn(messenger, '这一天已加密：正文留在原文件里，需要口令才能看。');
+}
+
+/// 解开整天：正文变回明文。
+///
+/// **必须确认**：这是把加密降级成明文存盘，用户得知道自己在做什么。
+Future<void> unlockWholeDayAction(
+  BuildContext context,
+  DiaryController controller,
+) async {
+  final messenger = ScaffoldMessenger.of(context);
+  final confirmed = await showDialog<bool>(
+    context: context,
+    builder: (context) => AlertDialog(
+      title: const Text('解开这一天？'),
+      content: const Text(
+        '解到之后，这一天的正文会**以明文存回磁盘**——'
+        '记事本、同步工具、手机上都能直接看到。\n\n'
+        '如果你只是想看，不需要解开：「日记加密」解锁之后就能看和搜，'
+        '磁盘上仍然是密文。',
+      ),
+      actions: <Widget>[
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(false),
+          child: const Text('不用了'),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.of(context).pop(true),
+          child: const Text('解成明文'),
+        ),
+      ],
+    ),
+  );
+  if (confirmed != true) return;
+
+  try {
+    await controller.unlockCurrentDay();
+    messenger.showSnackBar(
+      const SnackBar(content: Text('已解开：这一天在磁盘上现在是明文了。')),
+    );
+  } catch (error) {
+    messenger.showSnackBar(SnackBar(content: Text('解密失败：$error')));
+  }
+}
+
+/// 进入「显示原文」：整篇把黑条换成原文，**只读**。
+///
+/// 和「看这一段的内容」那个浮窗的区别：这个是整篇一次显示，
+/// 不用逐段移光标；而且它**不碰编辑框里真正的内容**——只是换一个
+/// 只读的显示控制器，所以保存路径完全不受影响。
+Future<void> revealWholeDayAction(
+  BuildContext context,
+  DiaryController controller,
+) async {
+  final messenger = ScaffoldMessenger.of(context);
+  try {
+    await controller.enterRevealMode();
+  } catch (error) {
+    messenger.showSnackBar(SnackBar(content: Text('打不开：$error')));
+    return;
+  }
+  if (!context.mounted) return;
+  messenger.showSnackBar(
+    const SnackBar(
+      content: Text('正在显示原文（只读）。写完记得点「回到黑条视图」。'),
+    ),
+  );
+}
+
+/// 锁上光标所在的这一行。
+Future<void> lockLineAction(
+  BuildContext context,
+  DiaryController controller,
+  int lineIndex,
+) async {
+  final messenger = ScaffoldMessenger.of(context);
+  try {
+    await controller.lockCurrentLine(lineIndex);
+    messenger.showSnackBar(
+      const SnackBar(content: Text('这一段已加密，在文件里就是一行黑条。')),
+    );
+  } catch (error) {
+    messenger.showSnackBar(SnackBar(content: Text('加密失败：$error')));
+  }
+}
+
+/// 看某一段黑条的原文。**只读浮窗**，绝不写回编辑框。
+///
+/// 为什么不写回编辑框：那样保存时程序就得猜"哪几段该重新加密"，而用户
+/// 可以在编辑框里任意增删——一旦猜错就会把明文写回磁盘，而且悄无声息。
+Future<void> revealRedactionAction(
+  BuildContext context,
+  DiaryController controller,
+  int lineIndex,
+) async {
+  final messenger = ScaffoldMessenger.of(context);
+  try {
+    final text = await controller.revealLine(lineIndex);
+    if (!context.mounted) return;
+    await showDialog<void>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('这一段的内容'),
+        content: SizedBox(
+          width: 420,
+          child: SingleChildScrollView(child: SelectableText(text)),
+        ),
+        actions: <Widget>[
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('关闭'),
+          ),
+        ],
+      ),
+    );
+  } catch (error) {
+    messenger.showSnackBar(SnackBar(content: Text('打不开这一段：$error')));
+  }
+}
+
+/// 解开某一段黑条（变回明文存盘）。
+Future<void> unlockLineAction(
+  BuildContext context,
+  DiaryController controller,
+  int lineIndex,
+) async {
+  final messenger = ScaffoldMessenger.of(context);
+  final confirmed = await showDialog<bool>(
+    context: context,
+    builder: (context) => AlertDialog(
+      title: const Text('解开这一段？'),
+      content: const Text('解到之后，这一段会**以明文存回磁盘**。'),
+      actions: <Widget>[
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(false),
+          child: const Text('不用了'),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.of(context).pop(true),
+          child: const Text('解成明文'),
+        ),
+      ],
+    ),
+  );
+  if (confirmed != true) return;
+
+  try {
+    await controller.unlockCurrentLine(lineIndex);
+    messenger.showSnackBar(SnackBar(content: Text('这一段已解开。')));
+  } catch (error) {
+    messenger.showSnackBar(SnackBar(content: Text('解密失败：$error')));
+  }
 }
 
 /// 时光机：随机翻到一篇以前写过的日记。

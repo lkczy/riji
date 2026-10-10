@@ -12,6 +12,7 @@ import '../state/settings_controller.dart';
 import 'diary_actions.dart';
 import 'markdown_formatting.dart';
 import 'theme.dart';
+import 'vault_menu.dart';
 
 /// 「外观」菜单里的动作。主题三档和字体设置放在同一个菜单里——
 /// 它们都是"看着舒服"这一类的事，没必要再占一个标题栏图标。
@@ -23,7 +24,23 @@ enum _AppearanceAction { system, light, dark, typography }
 /// （改日记位置、看历史），要么不该一点就中（删除）。
 ///
 /// 顺序是刻意的：**日常用的在上，碰数据管理的在中，破坏性的单独隔在下**。
-enum _MoreAction { openFolder, location, export, backup, reminder, history, trash, delete }
+enum _MoreAction {
+  openFolder,
+  location,
+  export,
+  backup,
+  reminder,
+  vault,
+  lockDay,
+  revealDay,
+  unlockDay,
+  lockLine,
+  revealLine,
+  unlockLine,
+  history,
+  trash,
+  delete,
+}
 
 /// 右侧写作区。
 ///
@@ -80,6 +97,26 @@ class _EditorPanelState extends State<EditorPanel> {
 
   DiaryController get _controller => widget.controller;
 
+  /// 「显示原文」模式下用的**只读**显示控制器。
+  ///
+  /// 为什么不用 `widget.bodyController`：那个控制器的内容才是要落盘的东西。
+  /// 把解密出来的原文灌进去，保存时就得分清"哪几段是展开的"——猜错就是
+  /// 把明文写进磁盘，而且悄无声息。所以这里另开一个，真正的那个一个字不动。
+  final TextEditingController _revealController = TextEditingController();
+
+  @override
+  void initState() {
+    super.initState();
+    widget.controller.addListener(_syncRevealText);
+  }
+
+  void _syncRevealText() {
+    final text = _controller.revealedText;
+    if (text == null || text == _revealController.text) return;
+    _revealController.text = text;
+    if (mounted) setState(() {});
+  }
+
   @override
   void dispose() {
     _moodInput.dispose();
@@ -115,7 +152,12 @@ class _EditorPanelState extends State<EditorPanel> {
         if (controller.onThisDay.isNotEmpty) _buildOnThisDay(context),
         if (controller.isCurrentEntryEmpty) _buildPromptCard(context),
         _buildFormatStrip(context),
+        // 锁着（还没解锁）时在写作区上方说清为什么打不了字、以及怎么解锁。
+        if (!controller.revealMode && controller.isCurrentBodyReadOnly)
+          _buildLockedBanner(context),
         const Divider(height: 1),
+        // 横线**以下**、写作区上方：「显示原文 / 回到黑条视图」这一个按钮
+        _buildRevealRow(context),
         Expanded(child: _buildWritingArea(context)),
         const Divider(height: 1),
         _buildStatusBar(context),
@@ -288,6 +330,50 @@ class _EditorPanelState extends State<EditorPanel> {
   Future<void> _travelToRandomEntry() =>
       travelToRandomEntryAction(context, _controller);
 
+  /// 写作区上方（**横线以下**）的「显示原文 / 回到黑条视图」按钮。
+  ///
+  /// 只在**这一天锁着、而且已经解锁**时出现——那时候它才有意义；
+  /// 没解锁就给一个点了没反应的按钮，比没有更糟。
+  /// 它和右键菜单、`⋮` 菜单是同一件事的不同入口，都调 controller 的同一对方法。
+  Widget _buildRevealRow(BuildContext context) {
+    final theme = Theme.of(context);
+    final controller = _controller;
+    if (!controller.currentDayIsLocked || !controller.canReadLocked) {
+      return const SizedBox.shrink();
+    }
+    final revealing = controller.revealMode;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(28, 8, 28, 0),
+      child: Align(
+        alignment: Alignment.centerRight,
+        // 固定宽度：两个状态的文案长短不同（"显示原文（只读）" / "回到黑条视图"），
+        // 不固定的话按钮会随文案忽宽忽窄，点起来会跳。
+        child: SizedBox(
+          width: 168,
+          child: TextButton.icon(
+          onPressed: () {
+            if (revealing) {
+              controller.exitRevealMode();
+            } else {
+              unawaited(revealWholeDayAction(context, controller));
+            }
+          },
+          icon: Icon(
+            revealing ? Icons.visibility_off_outlined : Icons.visibility_outlined,
+            size: 16,
+          ),
+          label: Text(revealing ? '回到黑条视图' : '显示原文（只读）'),
+          style: TextButton.styleFrom(
+            foregroundColor: revealing ? theme.colorScheme.primary : null,
+            padding: const EdgeInsets.symmetric(horizontal: 10),
+            minimumSize: const Size(0, 30),
+            tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+          ),
+        ),
+        ),
+      ),
+    );
+  }
   /// 外观切换（主题 + 字体）。
   ///
   /// 带文字标签，不是纯图标：纯图标按钮混在一排图标里根本看不出来是干什么的，
@@ -841,9 +927,37 @@ class _EditorPanelState extends State<EditorPanel> {
               },
               child: TextField(
                 key: const Key('diary-body-field'),
-                controller: widget.bodyController,
+                // 「显示原文」模式下换成**只读的显示控制器**：真正要落盘的
+                // `bodyController` 一个字都不动。把解出来的原文灌进那个控制器，
+                // 保存时就得靠"猜哪几行是展开的"——猜错就是把明文写进磁盘。
+                controller: _controller.revealMode
+                    ? _revealController
+                    : widget.bodyController,
                 focusNode: widget.bodyFocus,
-                expands: true,
+                // 锁着的天在解锁前只读；显示原文模式下也一律只读。
+                readOnly:
+                    _controller.isCurrentBodyReadOnly || _controller.revealMode,
+                // 右键菜单：系统自带的"复制/粘贴"后面接上加密那几项。
+                // 不用自己 showMenu：输入框自己会弹一个，自己再弹就是两个菜单叠着。
+                // 右键菜单：系统自带的"粘贴/全选"后面接上加密那几项。
+                //
+                // 为什么不用竖排 + 分隔线：这个工具栏是**固定高度的横排**
+                // （实测约束是 `0<=h<=44`），塞不下竖向菜单。要分隔线就得
+                // 整个换成为自己画的菜单（见开发须知里记的这条）。
+                contextMenuBuilder: (context, editableTextState) =>
+                    AdaptiveTextSelectionToolbar.buttonItems(
+                  anchors: editableTextState.contextMenuAnchors,
+                  buttonItems: <ContextMenuButtonItem>[
+                    ...editableTextState.contextMenuButtonItems,
+                    ...vaultContextMenuItems(
+                      context,
+                      controller: _controller,
+                      cursorLine: _cursorLine,
+                      onDone: editableTextState.hideToolbar,
+                      settings: widget.settings,
+                    ),
+                  ],
+                ),                expands: true,
                 maxLines: null,
                 minLines: null,
                 textAlignVertical: TextAlignVertical.top,
@@ -878,9 +992,13 @@ class _EditorPanelState extends State<EditorPanel> {
       child: Row(
         children: <Widget>[
           _buildSaveIndicator(context),
+          _buildVaultIndicator(context),
           const SizedBox(width: 16),
           Text(
-            '${controller.body.runes.length} 字',
+            // 锁着的天正文是空的（整天锁）或带黑条（按段锁），
+            // 所以字数要用条目里存的那份，否则这里会显示成 0 字，
+            // 看起来像"这天什么都没写"。
+            '${controller.currentCharacterCount} 字',
             style: theme.textTheme.bodySmall?.copyWith(
               color: theme.colorScheme.outline,
             ),
@@ -1012,6 +1130,8 @@ class _EditorPanelState extends State<EditorPanel> {
           value: _MoreAction.export,
           child: row(Icons.ios_share, '导出'),
         ),
+        // ---- 数据保护：备份 / 历史 / 回收站，都是"别丢东西" ----
+        const PopupMenuDivider(),
         // 预览模式没有可写的文件系统，这一项整个不出现——
         // 给一个点了会失败的按钮，比没有这个按钮更糟。
         if (platform.supportsBackup)
@@ -1019,14 +1139,6 @@ class _EditorPanelState extends State<EditorPanel> {
             value: _MoreAction.backup,
             child: row(Icons.save_outlined, '备份'),
           ),
-        // 每日提醒用计划任务 + Windows 通知，非 Windows 平台整个不出现——
-        // 和备份同一个理由：不给一个点了会失败的入口。
-        if (platform.supportsReminder)
-          PopupMenuItem<_MoreAction>(
-            value: _MoreAction.reminder,
-            child: row(Icons.notifications_active_outlined, '每日提醒'),
-          ),
-        const PopupMenuDivider(),
         PopupMenuItem<_MoreAction>(
           value: _MoreAction.history,
           child: row(Icons.history, '历史版本'),
@@ -1035,6 +1147,76 @@ class _EditorPanelState extends State<EditorPanel> {
           value: _MoreAction.trash,
           child: row(Icons.restore_from_trash, '回收站'),
         ),
+        // ---- 加密：只在真有加密能力时出现（预览模式没有文件系统）----
+        // 顺序：这一段 → 这一天 → 只是"看"的两项 → 设置入口。
+        // 先给"改动内容"的，再给"只看不改"的，最后才是低频的设置。
+        if (_controller.vault != null) ...<PopupMenuEntry<_MoreAction>>[
+          const PopupMenuDivider(),
+          if (_controller.canLock && !_controller.currentDayIsWholeDayLocked) ...<
+              PopupMenuEntry<_MoreAction>>[
+            if (_controller.lineIsRedacted(_cursorLine))
+              PopupMenuItem<_MoreAction>(
+                value: _MoreAction.unlockLine,
+                child: row(Icons.lock_open, '解密这段'),
+              )
+            else
+              PopupMenuItem<_MoreAction>(
+                value: _MoreAction.lockLine,
+                enabled: _controller.canLockLine(_cursorLine),
+                child: row(
+                  Icons.visibility_off_outlined,
+                  '加密这段',
+                  color: _controller.canLockLine(_cursorLine)
+                      ? null
+                      : theme.colorScheme.outline,
+                ),
+              ),
+          ],
+          if (_controller.currentDayIsWholeDayLocked)
+            PopupMenuItem<_MoreAction>(
+              value: _MoreAction.unlockDay,
+              enabled: _controller.canLock,
+              child: row(
+                Icons.lock_open,
+                '解密这天',
+                color: _controller.canLock ? null : theme.colorScheme.outline,
+              ),
+            )
+          else
+            PopupMenuItem<_MoreAction>(
+              value: _MoreAction.lockDay,
+              enabled: _controller.canLock,
+              child: row(
+                Icons.lock_outline,
+                '加密这天',
+                color: _controller.canLock ? null : theme.colorScheme.outline,
+              ),
+            ),
+          if (_controller.lineIsRedacted(_cursorLine))
+            PopupMenuItem<_MoreAction>(
+              value: _MoreAction.revealLine,
+              child: row(Icons.chrome_reader_mode_outlined, '看这段的内容'),
+            ),
+          if (_controller.currentDayIsLocked && _controller.canReadLocked)
+            PopupMenuItem<_MoreAction>(
+              value: _MoreAction.revealDay,
+              child: row(Icons.visibility_outlined, '显示原文（只读）'),
+            ),
+          PopupMenuItem<_MoreAction>(
+            value: _MoreAction.vault,
+            child: row(Icons.enhanced_encryption_outlined, '日记加密'),
+          ),
+        ],
+        // ---- 提醒：用计划任务 + Windows 通知，非 Windows 平台整个不出现 ----
+        if (platform.supportsReminder) ...<PopupMenuEntry<_MoreAction>>[
+          const PopupMenuDivider(),
+          PopupMenuItem<_MoreAction>(
+            value: _MoreAction.reminder,
+            child: row(Icons.notifications_active_outlined, '每日提醒'),
+          ),
+        ],
+
+        // ---- 危险：删除放最后，红字 ----
         const PopupMenuDivider(),
         PopupMenuItem<_MoreAction>(
           value: _MoreAction.delete,
@@ -1055,6 +1237,16 @@ class _EditorPanelState extends State<EditorPanel> {
   ///
   /// 这一层只负责"菜单点了哪一项"，不负责动作本身怎么实现——因为命令面板
   /// 要执行同一批动作，实现必须只有一份。
+  /// 光标所在的行号（从 0 开始）。加密菜单项全都针对这一行。
+  int get _cursorLine {
+    final text = widget.bodyController.text;
+    final selection = widget.bodyController.selection;
+    final offset = selection.isValid
+        ? selection.start.clamp(0, text.length)
+        : text.length;
+    return '\n'.allMatches(text.substring(0, offset)).length;
+  }
+
   Future<void> _handleMoreAction(_MoreAction action) async {
     switch (action) {
       case _MoreAction.openFolder:
@@ -1067,6 +1259,20 @@ class _EditorPanelState extends State<EditorPanel> {
         );
       case _MoreAction.reminder:
         await openReminderSettingsAction(context, widget.settings);
+      case _MoreAction.vault:
+        await openVaultAction(context, _controller, settings: widget.settings);
+      case _MoreAction.lockDay:
+        await lockWholeDayAction(context, _controller);
+      case _MoreAction.revealDay:
+        await revealWholeDayAction(context, _controller);
+      case _MoreAction.unlockDay:
+        await unlockWholeDayAction(context, _controller);
+      case _MoreAction.lockLine:
+        await lockLineAction(context, _controller, _cursorLine);
+      case _MoreAction.revealLine:
+        await revealRedactionAction(context, _controller, _cursorLine);
+      case _MoreAction.unlockLine:
+        await unlockLineAction(context, _controller, _cursorLine);
       case _MoreAction.location:
         widget.onOpenLocationSettings?.call();
       case _MoreAction.export:
@@ -1078,6 +1284,84 @@ class _EditorPanelState extends State<EditorPanel> {
       case _MoreAction.delete:
         await deleteCurrentEntryAction(context, _controller);
     }
+  }
+
+  /// 加密状态的**常驻**指示，兼"一键锁定"。
+  ///
+  /// 为什么必须有：解锁之后如果屏幕上一点痕迹都没有，用户走开一会儿回来
+  /// 就不知道现在还是解锁状态——那正是这类功能最容易出事的地方。
+  Widget _buildVaultIndicator(BuildContext context) {
+    final vault = _controller.vault;
+    if (vault == null || !vault.isConfigured) return const SizedBox.shrink();
+
+    final theme = Theme.of(context);
+    final unlocked = vault.isUnlocked;
+    final lockedDays = _controller.lockedEntriesCount;
+    if (!unlocked && lockedDays == 0) return const SizedBox.shrink();
+
+    final label = unlocked
+        ? (vault.isSearchRevealed ? '已解锁（只为搜索）' : '已解锁')
+        : '$lockedDays 篇已加密';
+
+    return Padding(
+      padding: const EdgeInsets.only(left: 12),
+      child: Tooltip(
+        message: unlocked ? '点一下立即锁定' : '点一下解锁',
+        child: TextButton.icon(
+          onPressed: () {
+            if (unlocked) {
+              vault.lock();
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(content: Text('已锁定：内存里的密钥和明文都清掉了。')),
+              );
+              return;
+            }
+            openVaultAction(context, _controller, settings: widget.settings);
+          },
+          icon: Icon(unlocked ? Icons.lock_open : Icons.lock_outline, size: 13),
+          label: Text(label),
+          style: TextButton.styleFrom(
+            padding: const EdgeInsets.symmetric(horizontal: 6),
+            minimumSize: const Size(0, 26),
+            tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            foregroundColor:
+                unlocked ? theme.colorScheme.primary : theme.colorScheme.outline,
+            textStyle: theme.textTheme.bodySmall,
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// 锁着（还没解锁）时的提示条：说清为什么打不了字、以及怎么解锁。
+  Widget _buildLockedBanner(BuildContext context) {
+    final theme = Theme.of(context);
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.fromLTRB(28, 10, 28, 0),
+      child: Row(
+        children: <Widget>[
+          Icon(Icons.lock_outline, size: 14, color: theme.colorScheme.outline),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              '这一天已加密：解锁之后才能修改正文（心情、天气、标签现在就能改）。',
+              style: theme.textTheme.bodySmall
+                  ?.copyWith(color: theme.colorScheme.outline),
+            ),
+          ),
+          TextButton(
+            onPressed: () => openVaultAction(context, _controller, settings: widget.settings),
+            style: TextButton.styleFrom(
+              padding: const EdgeInsets.symmetric(horizontal: 8),
+              minimumSize: const Size(0, 28),
+              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            ),
+            child: const Text('解锁'),
+          ),
+        ],
+      ),
+    );
   }
 
   Widget _buildSaveIndicator(BuildContext context) {

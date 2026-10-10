@@ -8,9 +8,12 @@ import '../core/huangli.dart';
 import '../core/models/diary_entry.dart';
 import '../data/huangli_source.dart';
 import '../state/diary_controller.dart';
+import '../state/settings_controller.dart';
 import 'filter_dialog.dart';
 import 'huangli_card.dart';
 import 'prompts.dart';
+import 'vault_dialog.dart';
+import 'vault_menu.dart';
 
 /// 给某一栏加「悬停 / 长按看黄历」的能力。
 ///
@@ -40,6 +43,7 @@ class _PeekTarget extends StatelessWidget {
     if (box is! RenderBox || !box.hasSize) return null;
     return box.localToGlobal(Offset.zero) & box.size;
   }
+
 
   @override
   Widget build(BuildContext context) {
@@ -77,10 +81,12 @@ class EntryListPanel extends StatefulWidget {
     super.key,
     required this.controller,
     required this.onPickDate,
+    required this.settings,
     this.searchFocus,
   });
 
   final DiaryController controller;
+  final SettingsController settings;
   final VoidCallback onPickDate;
 
   /// 搜索框的焦点节点，由上层持有。
@@ -204,6 +210,54 @@ class _EntryListPanelState extends State<EntryListPanel> {
     overlay.insert(entry);
   }
 
+  /// 左侧日期的右键菜单：加密/解密这一天。
+  ///
+  /// **先把那一天打开再算菜单项**：菜单里"能不能锁/能不能看原文"是按
+  /// "当前这一天"算的，不先切过去就会拿错日期的状态。
+  Future<void> _showEntryVaultMenu(Offset globalPosition, DateTime date) async {
+    final controller = widget.controller;
+    await controller.openDate(date);
+    if (!mounted) return;
+    await showVaultMenuAt(
+      context,
+      globalPosition: globalPosition,
+      controller: controller,
+      settings: widget.settings,
+      title: formatIsoDate(date),
+      // 「日记加密…」是设置，用「⋮」就够了，这里不放；
+      // 但"删掉这一天"要放——在列表里右键某一天，最自然的期待就是能处理它。
+      includeVaultDialog: false,
+      includeDeleteDay: true,
+    );
+  }
+
+  /// 「解锁来搜索」：只为这次搜索解锁，用完即丢。
+  ///
+  /// 它**不会**打开"能改写文件"那一档权限（见 `VaultService.canWrite`），
+  /// 所以即便点错了也不会把任何东西写成明文。
+  Future<void> _unlockForSearch() async {
+    final controller = widget.controller;
+    final vault = controller.vault;
+    if (vault == null) return;
+    final messenger = ScaffoldMessenger.of(context);
+
+    final result = await showVaultUnlockPrompt(context, vault: vault);
+    if (result == null || !result.ok) return;
+
+    final failed = await controller.prepareVaultForSearch();
+    if (failed > 0) {
+      messenger.showSnackBar(
+        SnackBar(
+          content: Text('有 $failed 天的内容解不开：文件可能被改过，或者不是用这个口令锁的。'),
+        ),
+      );
+      return;
+    }
+    messenger.showSnackBar(
+      const SnackBar(content: Text('已解锁：锁着的内容这次搜索也会参与。')),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -236,6 +290,43 @@ class _EntryListPanelState extends State<EntryListPanel> {
                 ),
                 onChanged: controller.setQuery,
               ),
+              // ⚠️ 搜索结果不完整必须说出来。
+              //
+              // 锁着、又还没解锁的那些天**没有参与搜索**。对用户来说，
+              // "搜不到"和"没搜"是两件完全不同的事：前者意味着"我没写过"，
+              // 后者只是"这会儿看不见"。让人把后者当成前者，是最不该发生
+              // 的一种误导——所以这行提示**命中为 0 时也照样显示**。
+              if (controller.lockedNotSearchedCount > 0) ...<Widget>[
+                const SizedBox(height: 8),
+                Row(
+                  children: <Widget>[
+                    Icon(
+                      Icons.lock_outline,
+                      size: 14,
+                      color: theme.colorScheme.outline,
+                    ),
+                    const SizedBox(width: 6),
+                    Expanded(
+                      child: Text(
+                        '另有 ${controller.lockedNotSearchedCount} 篇已加密，'
+                        '没有参与搜索',
+                        style: theme.textTheme.bodySmall?.copyWith(
+                          color: theme.colorScheme.outline,
+                        ),
+                      ),
+                    ),
+                    TextButton(
+                      onPressed: () => _unlockForSearch(),
+                      style: TextButton.styleFrom(
+                        padding: const EdgeInsets.symmetric(horizontal: 8),
+                        minimumSize: const Size(0, 28),
+                        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                      ),
+                      child: const Text('解锁来搜索'),
+                    ),
+                  ],
+                ),
+              ],
               const SizedBox(height: 8),
               Row(
                 children: <Widget>[
@@ -319,11 +410,19 @@ class _EntryListPanelState extends State<EntryListPanel> {
                         // 长按是明确的操作，立刻弹，不再等
                         onLongPress: _presentCard,
                         onDismiss: _scheduleDismiss,
-                        child: _EntryTile(
-                          entry: entry,
-                          selected:
-                              isSameDay(entry.date, controller.selectedDate),
-                          onTap: () => controller.openDate(entry.date),
+                        child: GestureDetector(
+                          // 右键：加密/解密这一天的菜单
+                          onSecondaryTapDown: (details) =>
+                              _showEntryVaultMenu(
+                            details.globalPosition,
+                            entry.date,
+                          ),
+                          child: _EntryTile(
+                            entry: entry,
+                            selected:
+                                isSameDay(entry.date, controller.selectedDate),
+                            onTap: () => controller.openDate(entry.date),
+                          ),
                         ),
                       );
                     },
@@ -453,6 +552,7 @@ class _EntryTile extends StatelessWidget {
   final bool selected;
   final VoidCallback onTap;
 
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -510,7 +610,7 @@ class _EntryTile extends StatelessWidget {
         children: <Widget>[
           if (annotation.hasLunarLine) _buildLunarLine(theme, annotation),
           Text(
-            entry.preview.isEmpty ? '（空）' : entry.preview,
+            entry.listPreview.isEmpty ? '（空）' : entry.listPreview,
             maxLines: 2,
             overflow: TextOverflow.ellipsis,
             style: theme.textTheme.bodySmall?.copyWith(

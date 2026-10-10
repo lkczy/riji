@@ -67,7 +67,7 @@ class _TrashDialogState extends State<TrashDialog> {
             fallbackTimestamp: item.deletedAt ?? item.date,
             fallbackDevice: 'trash',
           );
-          preview = entry.preview;
+          preview = entry.listPreview;
           characters = entry.body.runes.length;
         } catch (_) {
           // 单条读不动不能连累整个列表

@@ -72,7 +72,7 @@ class _HistoryDialogState extends State<HistoryDialog> {
         );
         rows.add(_HistoryRow(
           snapshot: snapshot,
-          preview: entry.preview,
+          preview: entry.listPreview,
           characters: entry.body.runes.length,
         ));
       }
