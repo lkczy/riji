@@ -631,6 +631,152 @@ void main() {
       expect(controller.entries, isNotEmpty);
     });
 
+    testWidgets('输对口令**不用按回车**，停手一下就自动进入', (tester) async {
+      final files = _FakeVaultFiles();
+      final vault = VaultService(
+        diaryRoot: r'D:\someone\MyData',
+        params: _fast,
+        deriveKey: stubDeriveKey,
+        readFile: files.read,
+        writeFile: files.write,
+        deleteFile: files.delete,
+      );
+      await vault.load();
+      await vault.setUp(_passphrase);
+      vault.lock();
+      final store = MemoryDiaryStore();
+      await store.save(DiaryEntry.create(
+        date: DateTime(2026, 10, 8), device: 'test', body: '记得买牛奶',
+      ));
+      await pumpApp(
+        tester,
+        store,
+        vault: vault,
+        settings: const AppSettings(
+          diaryRoot: r'D:\someone\MyData',
+          appLockEnabled: true,
+          appLockIdleMinutes: 5,
+        ),
+      );
+      expect(find.text('日迹已锁定'), findsOneWidget);
+
+      // 只输入，**不点「解锁」也不按回车**。
+      // 这里只等 250ms —— 防抖是 180ms，所以这同时是一条**回归护栏**：
+      // 谁把等待时间改长回去，这条测试立刻会红。
+      await tester.enterText(find.byType(TextField).first, _passphrase);
+      await tester.pump(const Duration(milliseconds: 250));
+      await tester.pumpAndSettle();
+
+      expect(find.text('日迹已锁定'), findsNothing, reason: '输对了应该自动进');
+      expect(find.byKey(bodyField), findsOneWidget);
+    });
+
+    testWidgets('口令不对时**什么都不显示**（别在人家还没打完时就报错）', (tester) async {
+      final files = _FakeVaultFiles();
+      final vault = VaultService(
+        diaryRoot: r'D:\someone\MyData',
+        params: _fast,
+        deriveKey: stubDeriveKey,
+        readFile: files.read,
+        writeFile: files.write,
+        deleteFile: files.delete,
+      );
+      await vault.load();
+      await vault.setUp(_passphrase);
+      vault.lock();
+      final store = MemoryDiaryStore();
+      await pumpApp(
+        tester,
+        store,
+        vault: vault,
+        settings: const AppSettings(
+          diaryRoot: r'D:\someone\MyData',
+          appLockEnabled: true,
+          appLockIdleMinutes: 5,
+        ),
+      );
+
+      await tester.enterText(find.byType(TextField).first, '这是没打完的口令');
+      await tester.pump(const Duration(milliseconds: 900));
+      await tester.pumpAndSettle();
+
+      expect(find.text('日迹已锁定'), findsOneWidget, reason: '错了就安静地留在锁屏');
+      expect(find.textContaining('不对'), findsNothing,
+          reason: '静默验证不该弹错误');
+      expect(find.byType(TextField), findsOneWidget, reason: '输入框还在');
+    });
+
+    testWidgets('主动点「解锁」时，错口令**要**报错（静默不该把这条路也弄哑）',
+        (tester) async {
+      final files = _FakeVaultFiles();
+      final vault = VaultService(
+        diaryRoot: r'D:\someone\MyData',
+        params: _fast,
+        deriveKey: stubDeriveKey,
+        readFile: files.read,
+        writeFile: files.write,
+        deleteFile: files.delete,
+      );
+      await vault.load();
+      await vault.setUp(_passphrase);
+      vault.lock();
+      final store = MemoryDiaryStore();
+      await pumpApp(
+        tester,
+        store,
+        vault: vault,
+        settings: const AppSettings(
+          diaryRoot: r'D:\someone\MyData',
+          appLockEnabled: true,
+          appLockIdleMinutes: 5,
+        ),
+      );
+
+      await tester.enterText(find.byType(TextField).first, '真的不对');
+      await tester.tap(find.text('解锁'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('日迹已锁定'), findsOneWidget);
+      expect(find.textContaining('不对'), findsWidgets,
+          reason: '显式解锁必须告诉你错在哪');
+    });
+
+    testWidgets('「日记加密」里输对口令也**不用按回车**', (tester) async {
+      final files = _FakeVaultFiles();
+      final vault = VaultService(
+        diaryRoot: r'D:\someone\MyData',
+        params: _fast,
+        deriveKey: stubDeriveKey,
+        readFile: files.read,
+        writeFile: files.write,
+        deleteFile: files.delete,
+      );
+      await vault.load();
+      await vault.setUp(_passphrase);
+      vault.lock(); // 会话锁上：app 仍然进得去（没开程序锁）
+      final store = MemoryDiaryStore();
+      await store.save(DiaryEntry.create(
+        date: DateTime(2026, 10, 8), device: 'test', body: '普通的一天',
+      ));
+      final controller = await pumpApp(tester, store, vault: vault);
+      await controller.openDate(DateTime(2026, 10, 8));
+      await tester.pumpAndSettle();
+
+      // 打开「日记加密」，这时是解锁表单
+      await tester.tap(find.byTooltip('更多'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('日记加密'));
+      await tester.pumpAndSettle();
+
+      // 只输入，不点「解锁」也不按回车，只等 250ms
+      await tester.enterText(find.byType(TextField).last, _passphrase);
+      await tester.pump(const Duration(milliseconds: 250));
+      await tester.pumpAndSettle();
+
+      expect(vault.isUnlocked, isTrue, reason: '停手一下就自动解锁了');
+      expect(find.text('已解锁'), findsWidgets, reason: '面板应该已经变成已解锁');
+    });
+
     testWidgets('没开程序锁时照常进主界面（哪怕保险库是锁的）', (tester) async {
       final fixture = await lockedFixture();
       final store = MemoryDiaryStore();
@@ -640,6 +786,45 @@ void main() {
 
       expect(find.text('日迹已锁定'), findsNothing);
       expect(find.byKey(bodyField), findsOneWidget);
+    });
+  });
+
+  group('解锁来搜索', () {
+    testWidgets('输对口令也**不用按回车**，框会自动关掉', (tester) async {
+      final files = _FakeVaultFiles();
+      final vault = VaultService(
+        diaryRoot: r'D:\someone\MyData',
+        params: _fast,
+        deriveKey: stubDeriveKey,
+        readFile: files.read,
+        writeFile: files.write,
+        deleteFile: files.delete,
+      );
+      await vault.load();
+      await vault.setUp(_passphrase);
+      final day = DateTime(2026, 10, 8);
+      final store = MemoryDiaryStore();
+      await store.save(await vault.lockLine(
+        DiaryEntry.create(date: day, device: 'test', body: '第一行\n$_secret'),
+        1,
+      ));
+      vault.lock(); // 会话锁上：左侧才会出现「解锁来搜索」
+      final controller = await pumpApp(tester, store, vault: vault);
+      await controller.openDate(day);
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.text('解锁来搜索'));
+      await tester.pumpAndSettle();
+      expect(vault.isUnlocked, isFalse);
+
+      // 只输入，不按回车、不点「解锁」，只等 250ms
+      await tester.enterText(find.byType(TextField).last, _passphrase);
+      await tester.pump(const Duration(milliseconds: 250));
+      await tester.pumpAndSettle();
+
+      expect(vault.isUnlocked, isTrue, reason: '停手一下就自动解锁了');
+      expect(vault.isSearchRevealed, isTrue, reason: '是"只为搜索"那种解锁');
+      expect(find.text('解锁来搜索'), findsNothing, reason: '框应该自己关掉');
     });
   });
 

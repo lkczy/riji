@@ -56,6 +56,13 @@ class _VaultDialogState extends State<VaultDialog> {
   final TextEditingController _confirm = TextEditingController();
   final TextEditingController _secret = TextEditingController();
 
+  /// 和锁屏同一套「停下来就静默验一次」：
+  /// 输对口令直接进，不用按回车；错了什么都不显示。
+  Timer? _autoUnlock;
+  String? _lastTried;
+  bool _verifying = false;
+  String? _pendingText;
+
   bool _busy = false;
   bool _useRecoveryCode = false;
 
@@ -70,6 +77,7 @@ class _VaultDialogState extends State<VaultDialog> {
   void dispose() {
     _passphrase.dispose();
     _confirm.dispose();
+    _autoUnlock?.cancel();
     _secret.dispose();
     super.dispose();
   }
@@ -140,6 +148,50 @@ class _VaultDialogState extends State<VaultDialog> {
       _secret.clear();
       _say(result.message);
     });
+  }
+
+  /// 停手约 180ms 就静默验一次（和锁屏同一个节奏）。
+  void _onSecretChanged(String value) {
+    _autoUnlock?.cancel();
+    final text = value.trim();
+    if (text.isEmpty || text == _lastTried) return;
+    _autoUnlock = Timer(const Duration(milliseconds: 180), () {
+      unawaited(_tryUnlockSilently(text));
+    });
+  }
+
+  /// 静默验证：对了直接进（面板自己会变成"已解锁"），错了什么都不显示。
+  /// 想立刻知道对错，仍然按回车或者点「解锁」。
+  Future<void> _tryUnlockSilently(String text) async {
+    if (_busy || !mounted) return;
+    if (_verifying) {
+      // 已经在验了：记下最新文字，等这轮结束接着验，别把你最后输的漏掉
+      _pendingText = text;
+      return;
+    }
+    _verifying = true;
+    _lastTried = text;
+    try {
+      final result = await widget.vault.unlock(
+        text,
+        isRecoveryCode: _useRecoveryCode,
+      );
+      if (!mounted) return;
+      if (result.ok) {
+        _autoUnlock?.cancel();
+        _secret.clear();
+        // 不弹提示：面板变成"已解锁"本身就是反馈
+        _verifying = false;
+        return;
+      }
+    } finally {
+      _verifying = false;
+    }
+    final pending = _pendingText;
+    _pendingText = null;
+    if (pending != null && pending != text && mounted) {
+      await _tryUnlockSilently(pending);
+    }
   }
 
   Future<void> _disable() async {
@@ -430,6 +482,7 @@ class _VaultDialogState extends State<VaultDialog> {
           obscureText: !_useRecoveryCode,
           enabled: !_busy,
           onSubmitted: (_) => _busy ? null : _unlock(),
+            onChanged: _onSecretChanged,
           decoration: InputDecoration(
             labelText: _useRecoveryCode ? '恢复码' : '口令',
             border: const OutlineInputBorder(),
@@ -638,14 +691,65 @@ class _VaultSearchUnlockDialog extends StatefulWidget {
 
 class _VaultSearchUnlockDialogState extends State<_VaultSearchUnlockDialog> {
   final TextEditingController _secret = TextEditingController();
+
   bool _busy = false;
   bool _useRecoveryCode = false;
+
+  /// 和另外两处同一套「停下来就静默验一次」：输对了自动进（并关掉这个框）。
+  Timer? _autoUnlock;
+  String? _lastTried;
+  bool _verifying = false;
+  String? _pendingText;
   String? _message;
 
   @override
   void dispose() {
+    _autoUnlock?.cancel();
     _secret.dispose();
     super.dispose();
+  }
+
+  void _onSecretChanged(String value) {
+    _autoUnlock?.cancel();
+    final text = value.trim();
+    if (text.isEmpty || text == _lastTried) return;
+    _autoUnlock = Timer(const Duration(milliseconds: 180), () {
+      unawaited(_tryUnlockSilently(text));
+    });
+  }
+
+  /// 静默验证：对了就和点「解锁」一样——把结果交回去，框自动关掉。
+  /// 错了什么都不显示；想立刻知道对错仍然按回车或点「解锁」。
+  Future<void> _tryUnlockSilently(String text) async {
+    if (_busy || !mounted) return;
+    if (_verifying) {
+      _pendingText = text;
+      return;
+    }
+    _verifying = true;
+    _lastTried = text;
+    try {
+      final result = await widget.vault.unlock(
+        text,
+        isRecoveryCode: _useRecoveryCode,
+        forSearchOnly: true,
+      );
+      if (!mounted) return;
+      if (result.ok) {
+        _autoUnlock?.cancel();
+        _verifying = false;
+        _secret.clear();
+        Navigator.of(context).pop(result);
+        return;
+      }
+    } finally {
+      _verifying = false;
+    }
+    final pending = _pendingText;
+    _pendingText = null;
+    if (pending != null && pending != text && mounted) {
+      await _tryUnlockSilently(pending);
+    }
   }
 
   Future<void> _submit() async {
@@ -693,6 +797,7 @@ class _VaultSearchUnlockDialogState extends State<_VaultSearchUnlockDialog> {
               autofocus: true,
               enabled: !_busy,
               onSubmitted: (_) => _busy ? null : _submit(),
+              onChanged: _onSecretChanged,
               decoration: InputDecoration(
                 labelText: _useRecoveryCode ? '恢复码' : '口令',
                 border: const OutlineInputBorder(),

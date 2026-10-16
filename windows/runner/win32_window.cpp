@@ -170,7 +170,46 @@ bool Win32Window::Create(const std::wstring& title,
 }
 
 bool Win32Window::Show() {
-  return ShowWindow(window_handle_, show_command_);
+  const bool shown = ShowWindow(window_handle_, show_command_);
+
+  // 把窗口带到**最前面**。
+  //
+  // 为什么不能只靠 ShowWindow：它能不能真的激活窗口，取决于调用方是不是
+  // 当前前台窗口所属的那个线程。Windows 有"前台锁"——后台进程的激活请求
+  // 可能被直接忽略，于是窗口静静地开在别的窗口后面。表现就是"有时候打开
+  // 程序，窗口不在最前面"（从任务栏、批处理、计划任务里启动时特别容易遇到）。
+  //
+  // 正规做法：把自己的输入队列临时挂到当前前台线程上，系统这时才允许我们
+  // 提升 z 序；做完立刻摘掉。已经在前台时这一整套什么都不会改变。
+  HWND foreground = ::GetForegroundWindow();
+  if (foreground != nullptr && foreground != window_handle_ &&
+      ::IsWindowVisible(window_handle_)) {
+    const DWORD foreground_thread =
+        ::GetWindowThreadProcessId(foreground, nullptr);
+    const DWORD this_thread = ::GetCurrentThreadId();
+    if (foreground_thread != 0 && foreground_thread != this_thread &&
+        ::AttachThreadInput(foreground_thread, this_thread, TRUE)) {
+      ::SetForegroundWindow(window_handle_);
+      ::BringWindowToTop(window_handle_);
+      ::SetFocus(window_handle_);
+      ::AttachThreadInput(foreground_thread, this_thread, FALSE);
+    }
+  }
+
+  // 上面那套在"前台锁"最严的情况下仍可能被拒（实测：从后台进程启动时
+  // 前台窗口没有被抢过来）。这里补一手最强也最短的：先把自己临时置顶
+  // 抢到 z 序，再立刻落回普通层——窗口于是必然出现在最前面，而且不会
+  // 一直压着别人。最后再请求一次激活，把键盘焦点也拿过来。
+  if (::IsWindowVisible(window_handle_)) {
+    ::SetWindowPos(window_handle_, HWND_TOPMOST, 0, 0, 0, 0,
+                   SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+    ::SetWindowPos(window_handle_, HWND_NOTOPMOST, 0, 0, 0, 0,
+                   SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+    ::SetForegroundWindow(window_handle_);
+    ::SetActiveWindow(window_handle_);
+  }
+
+  return shown;
 }
 
 void Win32Window::SetShowCommand(int show_command) {
